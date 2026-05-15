@@ -1,0 +1,29 @@
+[package]
+name = "libxmpp"
+description = "A small async XMPP client library built on Tokio"
+license = "MIT"
+homepage = "https://github.com/mikaelsahlstrom/libxmpp"
+repository = "https://github.com/mikaelsahlstrom/libxmpp"
+version = "0.1.3"
+edition = "2024"
+
+[lib]
+name = "xmpp"
+path = "src/lib.rs"
+create-type = "lib"
+
+[dependencies]
+tokio = { version = "1.52.2", features = ["full"] }
+tokio-rustls = "0.26.4"
+webpki-roots = "1.0.7"
+log = "0.4.29"
+quick-xml = { version = "0.39.2", features = ["serialize"] }
+serde = { version = "1.0.228", features = ["derive"] }
+base64 = "0.22.1"
+hmac = "0.13.0"
+sha1 = "0.11.0"
+sha2 = "0.11.0"
+rand = "0.10.1"
+
+[dev-dependencies]
+env_logger = "0.11.10"
