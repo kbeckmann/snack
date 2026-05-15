@@ -226,8 +226,11 @@ mod tests
 
     fn tempdir() -> PathBuf
     {
+        use std::sync::atomic::{ AtomicU32, Ordering };
+        static SEQ: AtomicU32 = AtomicU32::new(0);
+        let seq = SEQ.fetch_add(1, Ordering::Relaxed);
         let mut p = std::env::temp_dir();
-        p.push(format!("snack-omemo-test-{}", std::process::id()));
+        p.push(format!("snack-omemo-test-{}-{}", std::process::id(), seq));
         let _ = fs::remove_dir_all(&p);
         fs::create_dir_all(&p).unwrap();
         return p;

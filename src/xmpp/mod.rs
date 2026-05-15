@@ -1,7 +1,9 @@
 use iced::futures::SinkExt;
 use iced::stream;
-use log::error;
+use log::{ error, warn };
 use std::sync::{ Arc, Mutex };
+
+use crate::omemo::OmemoController;
 
 #[derive(Debug)]
 pub enum XmppCommand
@@ -80,6 +82,12 @@ pub enum XmppEvent
         body: String,
         timestamp: chrono::DateTime<chrono::Utc>,
     },
+    OmemoReady
+    {
+        device_id: u32,
+        fingerprint: String,
+    },
+    OmemoError(String),
 }
 
 pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEvent>
@@ -126,6 +134,50 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                     {
                         let _ = bridge_tx.send(XmppEvent::Disconnected(e)).await;
                         return;
+                    }
+                };
+
+                // Set up OMEMO: load / generate identity, publish bundle.
+                let bare_jid = jid.split('/').next().unwrap_or(&jid).to_string();
+                let mut omemo: Option<OmemoController> = match crate::storage::data_dir()
+                {
+                    Some(dir) =>
+                    {
+                        match OmemoController::open(&dir, &bare_jid)
+                        {
+                            Ok(mut ctrl) =>
+                            {
+                                match ctrl.publish_bundle_and_device_list(&mut client).await
+                                {
+                                    Ok(()) =>
+                                    {
+                                        let _ = bridge_tx.send(XmppEvent::OmemoReady
+                                        {
+                                            device_id: ctrl.device_id(),
+                                            fingerprint: ctrl.identity_fingerprint(),
+                                        }).await;
+                                        Some(ctrl)
+                                    }
+                                    Err(e) =>
+                                    {
+                                        warn!("OMEMO publish failed: {}", e);
+                                        let _ = bridge_tx.send(XmppEvent::OmemoError(e.to_string())).await;
+                                        Some(ctrl)
+                                    }
+                                }
+                            }
+                            Err(e) =>
+                            {
+                                warn!("OMEMO init failed: {}", e);
+                                let _ = bridge_tx.send(XmppEvent::OmemoError(e.to_string())).await;
+                                None
+                            }
+                        }
+                    }
+                    None =>
+                    {
+                        warn!("Could not resolve data dir for OMEMO");
+                        None
                     }
                 };
 
@@ -182,6 +234,64 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                                                 .unwrap_or_else(chrono::Utc::now);
                                             Some(XmppEvent::DirectMessage { from, body, timestamp: ts })
                                         }
+                                        ::xmpp::XmppEvent::EncryptedDirectMessage
+                                        {
+                                            from, sid, keys, iv_b64, payload_b64, timestamp,
+                                        } =>
+                                        {
+                                            let ts = timestamp
+                                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                                                .map(|dt| dt.with_timezone(&chrono::Utc))
+                                                .unwrap_or_else(chrono::Utc::now);
+
+                                            let peer_bare = from.split('/').next().unwrap_or(&from).to_string();
+                                            let encrypted = ::xmpp::OmemoEncrypted
+                                            {
+                                                sid,
+                                                keys,
+                                                iv_b64,
+                                                payload_b64,
+                                            };
+
+                                            match omemo.as_mut()
+                                            {
+                                                Some(ctrl) =>
+                                                {
+                                                    match ctrl.decrypt_from_peer(&peer_bare, &encrypted)
+                                                    {
+                                                        Ok(Some(body)) =>
+                                                        {
+                                                            Some(XmppEvent::DirectMessage { from, body, timestamp: ts })
+                                                        }
+                                                        Ok(None) => None,
+                                                        Err(e) =>
+                                                        {
+                                                            warn!("OMEMO decrypt failed from {}: {}", peer_bare, e);
+                                                            Some(XmppEvent::OmemoError(format!("decrypt: {}", e)))
+                                                        }
+                                                    }
+                                                }
+                                                None => None,
+                                            }
+                                        }
+                                        ::xmpp::XmppEvent::PubSubEvent { from, node, items } =>
+                                        {
+                                            // Cache peer device-list updates so the next outbound
+                                            // OMEMO message picks them up without an extra round-trip.
+                                            if node == ::xmpp::OMEMO_DEVICELIST_NODE
+                                            {
+                                                if let (Some(ctrl), Some(item)) = (omemo.as_mut(), items.first())
+                                                {
+                                                    if let Ok(list) = ::xmpp::DeviceList::from_xml(&item.payload_xml)
+                                                    {
+                                                        let bare = from.split('/').next().unwrap_or(&from).to_string();
+                                                        ctrl.store.set_peer_device_list(&bare, list.devices);
+                                                        let _ = ctrl.store.save();
+                                                    }
+                                                }
+                                            }
+                                            None
+                                        }
                                         _ => None,
                                     };
 
@@ -231,7 +341,33 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                                 }
                                 Some(XmppCommand::SendDirectMessage { to, body }) =>
                                 {
-                                    if let Err(e) = client.send_message(&to, &body).await
+                                    let bare = to.split('/').next().unwrap_or(&to).to_string();
+
+                                    let send_result = if let Some(ctrl) = omemo.as_mut()
+                                    {
+                                        match ctrl.encrypt_to_peer(&mut client, &bare, &body).await
+                                        {
+                                            Ok(encrypted) =>
+                                            {
+                                                let msg = crate::omemo::protocol::build_chat_message(
+                                                    &bare, encrypted,
+                                                );
+                                                client.send_omemo_message(&msg).await
+                                            }
+                                            Err(e) =>
+                                            {
+                                                warn!("OMEMO encrypt failed for {}: {}; falling back to plaintext", bare, e);
+                                                let _ = bridge_tx.send(XmppEvent::OmemoError(e.to_string())).await;
+                                                client.send_message(&to, &body).await
+                                            }
+                                        }
+                                    }
+                                    else
+                                    {
+                                        client.send_message(&to, &body).await
+                                    };
+
+                                    if let Err(e) = send_result
                                     {
                                         error!("Failed to send direct message: {}", e);
                                     }

@@ -71,6 +71,14 @@ fn config_path() -> Option<PathBuf>
         .map(|d| d.config_dir().join(CONFIG_FILE));
 }
 
+/// Returns the application data directory used for non-secret state
+/// (currently: OMEMO sessions and pre-keys).
+pub fn data_dir() -> Option<PathBuf>
+{
+    return ProjectDirs::from("org", "snack", "snack")
+        .map(|d| d.data_dir().to_path_buf());
+}
+
 pub fn load() -> SavedConfig
 {
     let Some(path) = config_path() else

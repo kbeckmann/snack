@@ -603,6 +603,14 @@ impl Snack
                             r.topic = subject;
                         }
                     }
+                    xmpp::XmppEvent::OmemoReady { device_id, fingerprint } =>
+                    {
+                        log::info!("OMEMO ready: device {} fingerprint {}", device_id, fingerprint);
+                    }
+                    xmpp::XmppEvent::OmemoError(e) =>
+                    {
+                        log::warn!("OMEMO: {}", e);
+                    }
                     xmpp::XmppEvent::DirectMessage { from, body, timestamp } =>
                     {
                         let bare = from.split('/').next().unwrap_or(&from).to_string();
