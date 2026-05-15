@@ -4,6 +4,7 @@ use iced::{ Application, Element, Program, Task, Theme, Fill };
 use iced::widget::{ row, Id };
 use log::error;
 
+mod omemo;
 mod room;
 mod storage;
 mod ui;
