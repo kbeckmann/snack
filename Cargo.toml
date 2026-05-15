@@ -1,3 +1,6 @@
+[workspace]
+members = ["vendor/libxmpp"]
+
 [package]
 name = "snack"
 version = "0.1.0"

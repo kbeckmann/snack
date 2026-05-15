@@ -1,10 +1,11 @@
 use tokio::sync::mpsc;
 use std::collections::{HashMap, HashSet};
 
-use crate::{XmppEvent, RoomMember};
+use crate::{XmppEvent, RoomMember, IqWaiters, IqError, PubSubItem};
 use crate::tcp_stream::Tcp;
 use crate::stanza;
 use crate::stanza::Stanza;
+use crate::stanza::omemo::OmemoEncrypted;
 use crate::xml_framer::XmlFramer;
 
 pub async fn setup_connection(event_tx: &mpsc::Sender<XmppEvent>, jid: &str, password: &str) -> Result<(String, Tcp), String>
@@ -256,9 +257,15 @@ pub async fn process_stanza(
     pending_joins: &mut HashMap<String, Vec<RoomMember>>,
     pending_messages: &mut HashMap<String, Vec<XmppEvent>>,
     joined_rooms: &mut HashSet<String>,
+    iq_waiters: &IqWaiters,
 )
 {
-    if xml.contains("<presence") && (xml.contains("type='error'") || xml.contains("type=\"error\""))
+    if xml.starts_with("<iq") || xml.starts_with("<iq ")
+    {
+        handle_iq(xml, event_tx, iq_waiters).await;
+        return;
+    }
+    else if xml.contains("<presence") && (xml.contains("type='error'") || xml.contains("type=\"error\""))
     {
         let error = match stanza::muc::PresenceErrorStanza::from_xml(xml)
         {
@@ -368,8 +375,26 @@ pub async fn process_stanza(
             }
         }
     }
+    else if xml.contains("<message") && xml.contains("http://jabber.org/protocol/pubsub#event")
+    {
+        if let Some(event) = parse_pubsub_event(xml)
+        {
+            let _ = event_tx.send(event).await;
+        }
+    }
     else if xml.contains("<message") && (xml.contains("type='chat'") || xml.contains("type=\"chat\""))
     {
+        // OMEMO encrypted? Detect cheaply before parsing the chat envelope.
+        if xml.contains("eu.siacs.conversations.axolotl")
+            && xml.contains("<encrypted")
+        {
+            if let Some(event) = parse_encrypted_chat(xml)
+            {
+                let _ = event_tx.send(event).await;
+                return;
+            }
+        }
+
         let msg = match stanza::chat::IncomingChatMessage::from_xml(xml)
         {
             Ok(m) => m,
@@ -452,5 +477,315 @@ pub async fn process_stanza(
                 });
             }
         }
+    }
+}
+
+/// Detect IQ result/error and route to a pending waiter; emit IncomingIq
+/// for get/set IQs from peers.
+async fn handle_iq(
+    xml: &str,
+    event_tx: &mpsc::Sender<XmppEvent>,
+    iq_waiters: &IqWaiters,
+)
+{
+    let iq_type = read_attr(xml, "type").unwrap_or_default();
+    let id = read_attr(xml, "id").unwrap_or_default();
+    let from = read_attr(xml, "from");
+
+    match iq_type.as_str()
+    {
+        "result" =>
+        {
+            if let Some(tx) = iq_waiters.lock().unwrap().remove(&id)
+            {
+                let _ = tx.send(Ok(xml.to_string()));
+            }
+        }
+        "error" =>
+        {
+            if let Some(tx) = iq_waiters.lock().unwrap().remove(&id)
+            {
+                let err = parse_iq_error(xml);
+                let _ = tx.send(Err(err));
+            }
+        }
+        "get" | "set" =>
+        {
+            let payload_xml = inner_xml(xml).unwrap_or_default();
+            let _ = event_tx.send(XmppEvent::IncomingIq
+            {
+                id,
+                iq_type,
+                from,
+                payload_xml,
+            }).await;
+        }
+        _ => {}
+    }
+}
+
+fn parse_iq_error(xml: &str) -> IqError
+{
+    let cond = find_first_known_condition(xml).unwrap_or_else(|| "undefined-condition".into());
+    let text = inner_text_of(xml, "text");
+    return IqError { condition: cond, text };
+}
+
+fn find_first_known_condition(xml: &str) -> Option<String>
+{
+    // RFC 6120 §8.3.3 stanza error conditions. Order doesn't matter; we
+    // return the first one we find as a string.
+    const CONDITIONS: &[&str] = &[
+        "bad-request", "conflict", "feature-not-implemented", "forbidden",
+        "gone", "internal-server-error", "item-not-found", "jid-malformed",
+        "not-acceptable", "not-allowed", "not-authorized", "policy-violation",
+        "recipient-unavailable", "redirect", "registration-required",
+        "remote-server-not-found", "remote-server-timeout", "resource-constraint",
+        "service-unavailable", "subscription-required", "undefined-condition",
+        "unexpected-request",
+    ];
+
+    for c in CONDITIONS
+    {
+        if xml.contains(&format!("<{}", c))
+        {
+            return Some(c.to_string());
+        }
+    }
+    return None;
+}
+
+/// Return the children of the root element as raw XML (trimming whitespace).
+/// Used to surface IQ payloads back to callers.
+fn inner_xml(xml: &str) -> Option<String>
+{
+    let open_end = xml.find('>')?;
+    let close = xml.rfind('<')?;
+    if close <= open_end + 1
+    {
+        return Some(String::new());
+    }
+
+    return Some(xml[open_end + 1..close].trim().to_string());
+}
+
+fn inner_text_of(xml: &str, tag: &str) -> Option<String>
+{
+    let open = format!("<{}", tag);
+    let mut from = 0;
+    while let Some(rel) = xml[from..].find(&open)
+    {
+        let pos = from + rel;
+        let after = pos + open.len();
+        let next = xml.as_bytes().get(after).copied().unwrap_or(0);
+        if matches!(next, b' ' | b'>' | b'/' | b'\t' | b'\n' | b'\r')
+        {
+            let end_of_open = xml[pos..].find('>').map(|p| p + pos)?;
+            if xml.as_bytes()[end_of_open - 1] == b'/'
+            {
+                return None;
+            }
+
+            let close = format!("</{}>", tag);
+            let close_pos = xml[end_of_open + 1..].find(&close)? + end_of_open + 1;
+            return Some(xml[end_of_open + 1..close_pos].trim().to_string());
+        }
+        from = pos + open.len();
+    }
+
+    return None;
+}
+
+fn read_attr(xml: &str, name: &str) -> Option<String>
+{
+    let open_end = xml.find('>')?;
+    let header = &xml[..open_end];
+    for q in ['\'', '"']
+    {
+        let needle = format!("{}={}", name, q);
+        if let Some(start) = header.find(&needle)
+        {
+            // Ensure name is preceded by whitespace
+            if start > 0
+            {
+                let prev = header.as_bytes()[start - 1];
+                if !matches!(prev, b' ' | b'\t' | b'\n' | b'\r')
+                {
+                    continue;
+                }
+            }
+            let val_start = start + needle.len();
+            if let Some(end) = header[val_start..].find(q)
+            {
+                return Some(header[val_start..val_start + end].to_string());
+            }
+        }
+    }
+
+    return None;
+}
+
+fn parse_pubsub_event(xml: &str) -> Option<XmppEvent>
+{
+    let from = read_attr(xml, "from").unwrap_or_default();
+
+    // Find <items node='...'>
+    let items_start = xml.find("<items ")?;
+    let items_open_end = xml[items_start..].find('>')? + items_start + 1;
+    let items_header = &xml[items_start..items_open_end];
+    let node = extract_attr(items_header, "node")?;
+    let items_close = xml[items_open_end..].find("</items>")? + items_open_end;
+    let items_body = &xml[items_open_end..items_close];
+
+    let mut items = Vec::new();
+    let mut pos = 0;
+    while let Some(off) = items_body[pos..].find("<item")
+    {
+        let item_start = pos + off;
+        let item_open_end = items_body[item_start..].find('>')? + item_start + 1;
+        let item_header = &items_body[item_start..item_open_end];
+
+        if item_header.ends_with("/>")
+        {
+            pos = item_open_end;
+            continue;
+        }
+
+        let item_close = items_body[item_open_end..].find("</item>")? + item_open_end;
+        let id = extract_attr(item_header, "id");
+        let payload_xml = items_body[item_open_end..item_close].trim().to_string();
+        items.push(PubSubItem { id, payload_xml });
+        pos = item_close + "</item>".len();
+    }
+
+    return Some(XmppEvent::PubSubEvent { from, node, items });
+}
+
+fn parse_encrypted_chat(xml: &str) -> Option<XmppEvent>
+{
+    let from = read_attr(xml, "from")?;
+    let enc = OmemoEncrypted::from_xml(xml).ok()?;
+    let timestamp = read_delay_stamp(xml);
+    return Some(XmppEvent::EncryptedDirectMessage
+    {
+        from,
+        sid: enc.sid,
+        keys: enc.keys,
+        iv_b64: enc.iv_b64,
+        payload_b64: enc.payload_b64,
+        timestamp,
+    });
+}
+
+fn read_delay_stamp(xml: &str) -> Option<String>
+{
+    let start = xml.find("<delay")?;
+    let open_end = xml[start..].find('>')? + start + 1;
+    let header = &xml[start..open_end];
+    return extract_attr(header, "stamp");
+}
+
+fn extract_attr(tag: &str, name: &str) -> Option<String>
+{
+    for q in ['\'', '"']
+    {
+        let needle = format!("{}={}", name, q);
+        if let Some(pos) = tag.find(&needle)
+        {
+            let start = pos + needle.len();
+            if let Some(end) = tag[start..].find(q)
+            {
+                return Some(tag[start..start + end].to_string());
+            }
+        }
+    }
+    return None;
+}
+
+#[cfg(test)]
+mod tests
+{
+    use super::*;
+
+    #[test]
+    fn parse_iq_error_extracts_condition()
+    {
+        let xml = "<iq type='error' id='1'><error type='cancel'>\
+            <item-not-found xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/>\
+            <text xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'>missing</text>\
+            </error></iq>";
+
+        let err = parse_iq_error(xml);
+        assert_eq!(err.condition, "item-not-found");
+        assert_eq!(err.text.as_deref(), Some("missing"));
+    }
+
+    #[test]
+    fn parse_pubsub_event_extracts_items()
+    {
+        let xml = "<message from='alice@example.com' type='headline'>\
+            <event xmlns='http://jabber.org/protocol/pubsub#event'>\
+                <items node='eu.siacs.conversations.axolotl.devicelist'>\
+                    <item id='current'><list xmlns='eu.siacs.conversations.axolotl'><device id='9'/></list></item>\
+                </items>\
+            </event>\
+        </message>";
+
+        let event = parse_pubsub_event(xml).expect("parse_pubsub_event");
+        match event
+        {
+            XmppEvent::PubSubEvent { from, node, items } =>
+            {
+                assert_eq!(from, "alice@example.com");
+                assert_eq!(node, "eu.siacs.conversations.axolotl.devicelist");
+                assert_eq!(items.len(), 1);
+                assert_eq!(items[0].id.as_deref(), Some("current"));
+            }
+            _ => panic!("wrong event"),
+        }
+    }
+
+    #[test]
+    fn parse_encrypted_chat_event()
+    {
+        let xml = "<message from='bob@example.com' type='chat'>\
+            <encrypted xmlns='eu.siacs.conversations.axolotl'>\
+                <header sid='1'>\
+                    <key rid='2' prekey='true'>QQ==</key>\
+                    <iv>SVY=</iv>\
+                </header>\
+                <payload>UA==</payload>\
+            </encrypted>\
+            <body>OMEMO hint</body>\
+        </message>";
+
+        let event = parse_encrypted_chat(xml).expect("parse_encrypted_chat");
+        match event
+        {
+            XmppEvent::EncryptedDirectMessage { from, sid, keys, payload_b64, .. } =>
+            {
+                assert_eq!(from, "bob@example.com");
+                assert_eq!(sid, 1);
+                assert_eq!(keys.len(), 1);
+                assert!(keys[0].prekey);
+                assert_eq!(payload_b64.as_deref(), Some("UA=="));
+            }
+            _ => panic!("wrong event"),
+        }
+    }
+
+    #[test]
+    fn read_attr_returns_quoted_value()
+    {
+        let xml = "<iq type='get' id='abc'><x/></iq>";
+        assert_eq!(read_attr(xml, "type").as_deref(), Some("get"));
+        assert_eq!(read_attr(xml, "id").as_deref(), Some("abc"));
+    }
+
+    #[test]
+    fn inner_xml_returns_payload()
+    {
+        let xml = "<iq type='result' id='1'><a/><b>text</b></iq>";
+        assert_eq!(inner_xml(xml).as_deref(), Some("<a/><b>text</b>"));
     }
 }

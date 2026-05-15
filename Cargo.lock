@@ -2012,6 +2012,7 @@ name = "libxmpp"
 version = "0.1.3"
 dependencies = [
  "base64",
+ "env_logger",
  "hmac 0.13.0",
  "log",
  "quick-xml",
