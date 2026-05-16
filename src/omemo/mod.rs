@@ -22,6 +22,7 @@ pub mod session;
 pub mod identity;
 pub mod store;
 pub mod protocol;
+pub mod signal_message;
 
 pub use identity::{ IdentityKeyPair, SignedPreKey, OneTimePreKey };
 pub use session::{ Session, SessionError, EncryptedMessage, IncomingMessage };

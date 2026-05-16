@@ -19,6 +19,7 @@
 //! OPK to use from the embedded ids.
 
 use super::crypto::{ hkdf_sha256, xeddsa_verify, CryptoError, X25519KeyPair };
+use super::signal_message::wire_key_33;
 
 /// HKDF "info" string. OMEMO legacy follows libsignal which uses "WhisperText".
 pub const KDF_INFO: &[u8] = b"WhisperText";
@@ -63,7 +64,10 @@ pub fn initiator_x3dh(
     peer: &PeerBundle,
 ) -> Result<InitiatorAgreement, X3dhError>
 {
-    xeddsa_verify(&peer.identity_key, &peer.signed_pre_key, &peer.signed_pre_key_sig)
+    // Verify against the wire-form (DJB-prefixed) public key — that is
+    // what other OMEMO clients sign and verify against.
+    let spk_wire = wire_key_33(&peer.signed_pre_key);
+    xeddsa_verify(&peer.identity_key, &spk_wire, &peer.signed_pre_key_sig)
         .map_err(|_| X3dhError::InvalidSignedPreKeySignature)?;
 
     let ephemeral = X25519KeyPair::generate();
@@ -145,7 +149,8 @@ mod tests
         let signed_pre_key = X25519KeyPair::generate();
         let one_time_pre_key = X25519KeyPair::generate();
         let ephemeral = X25519KeyPair::generate(); // initiator's
-        let sig = xeddsa_sign(&identity.private_bytes(), &signed_pre_key.public_bytes());
+        let spk_wire = wire_key_33(&signed_pre_key.public_bytes());
+        let sig = xeddsa_sign(&identity.private_bytes(), &spk_wire);
         return (identity, signed_pre_key, one_time_pre_key, ephemeral, sig);
     }
 

@@ -293,7 +293,10 @@ mod tests
         let bob_id = X25519KeyPair::generate();
         let bob_spk = X25519KeyPair::generate();
         let bob_opk = X25519KeyPair::generate();
-        let sig = xeddsa_sign(&bob_id.private_bytes(), &bob_spk.public_bytes());
+        let sig = xeddsa_sign(
+            &bob_id.private_bytes(),
+            &crate::omemo::signal_message::wire_key_33(&bob_spk.public_bytes()),
+        );
 
         let bundle = PeerBundle
         {
@@ -357,7 +360,10 @@ mod tests
         let alice_id = X25519KeyPair::generate();
         let bob_id = X25519KeyPair::generate();
         let bob_spk = X25519KeyPair::generate();
-        let sig = xeddsa_sign(&bob_id.private_bytes(), &bob_spk.public_bytes());
+        let sig = xeddsa_sign(
+            &bob_id.private_bytes(),
+            &crate::omemo::signal_message::wire_key_33(&bob_spk.public_bytes()),
+        );
 
         let bundle = PeerBundle
         {
@@ -405,7 +411,10 @@ mod tests
         let alice_id = X25519KeyPair::generate();
         let bob_id = X25519KeyPair::generate();
         let bob_spk = X25519KeyPair::generate();
-        let sig = xeddsa_sign(&bob_id.private_bytes(), &bob_spk.public_bytes());
+        let sig = xeddsa_sign(
+            &bob_id.private_bytes(),
+            &crate::omemo::signal_message::wire_key_33(&bob_spk.public_bytes()),
+        );
 
         let bundle = PeerBundle
         {

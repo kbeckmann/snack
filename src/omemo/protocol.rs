@@ -26,6 +26,13 @@ use super::crypto::{
 use super::identity::{ IdentityKeyPair, OneTimePreKey, SignedPreKey, OTPK_BATCH_SIZE };
 use super::ratchet::RatchetState;
 use super::session::{ PendingPreKeyData, Session };
+use super::signal_message::{
+    aes256_cbc_decrypt, aes256_cbc_encrypt,
+    decode_prekey_message, decode_signal_message,
+    derive_message_keys, encode_prekey_message, encode_signal_message,
+    strip_djb_prefix, wire_key_33,
+    PreKeySignalMessage, SignalMessage,
+};
 use super::store::{ OmemoStore, StoreError, Trust };
 use super::x3dh::{ initiator_x3dh, responder_x3dh, PeerBundle, ResponderInputs };
 
@@ -137,22 +144,24 @@ impl OmemoController
         return fingerprint_hex(&self.identity.public_bytes());
     }
 
-    /// Build our own bundle as it should be published. Caller serialises
-    /// to wire XML via `bundle.to_xml()`.
+    /// Build our own bundle as it should be published. Each public key is
+    /// emitted in libsignal wire form (33 bytes: `0x05 || raw 32-byte`)
+    /// and the signed pre-key signature is over the wire-form bytes —
+    /// this is what Conversations / Dino / Gajim verify.
     pub fn build_bundle(&self) -> WireBundle
     {
         let pre_keys = self.one_time_pre_keys.iter().map(|p| WirePreKey
         {
             id: p.id,
-            public_b64: B64.encode(p.keypair.public_bytes()),
+            public_b64: B64.encode(wire_key_33(&p.keypair.public_bytes())),
         }).collect();
 
         return WireBundle
         {
             signed_pre_key_id: self.signed_pre_key.id,
-            signed_pre_key_public_b64: B64.encode(self.signed_pre_key.keypair.public_bytes()),
+            signed_pre_key_public_b64: B64.encode(wire_key_33(&self.signed_pre_key.keypair.public_bytes())),
             signed_pre_key_signature_b64: B64.encode(self.signed_pre_key.signature),
-            identity_key_b64: B64.encode(self.identity.public_bytes()),
+            identity_key_b64: B64.encode(wire_key_33(&self.identity.public_bytes())),
             pre_keys,
         };
     }
@@ -296,7 +305,6 @@ impl OmemoController
         plaintext: &str,
     ) -> Result<OmemoEncrypted, OmemoError>
     {
-        // Make sure we know the peer's device list.
         let peer_devices = match self.store.peer_device_list(peer_jid)
         {
             Some(list) if !list.is_empty() => list,
@@ -308,30 +316,28 @@ impl OmemoController
             return Err(OmemoError::NoPeerDevices(peer_jid.to_string()));
         }
 
-        // Sessions for every peer device (and any other devices we own).
         for &did in &peer_devices
         {
             self.ensure_session(client, peer_jid, did).await?;
         }
 
-        // Generate the per-message AES-128-GCM key/IV and encrypt the
-        // payload.
+        // Outer OMEMO payload: AES-128-GCM with a random key/IV. The
+        // 16-byte AES key plus 16-byte GCM auth tag is what each per-
+        // recipient `<key>` wraps via libsignal.
         let mut key = [0u8; OMEMO_AES_KEY_LEN];
         let mut iv = [0u8; OMEMO_AES_IV_LEN];
         key.copy_from_slice(&random_bytes(OMEMO_AES_KEY_LEN));
         iv.copy_from_slice(&random_bytes(OMEMO_AES_IV_LEN));
 
         let ct_with_tag = aes128_gcm_encrypt(&key, &iv, plaintext.as_bytes())?;
-
-        // Split ciphertext and tag so we can wrap the tag with the key.
         let split_at = ct_with_tag.len().saturating_sub(OMEMO_AES_TAG_LEN);
         let (ciphertext, tag) = ct_with_tag.split_at(split_at);
 
-        // Build the wrapped key (key || tag) — what the Signal ratchet
-        // encrypts per recipient.
         let mut key_with_tag = [0u8; 32];
         key_with_tag[..OMEMO_AES_KEY_LEN].copy_from_slice(&key);
         key_with_tag[OMEMO_AES_KEY_LEN..].copy_from_slice(tag);
+
+        let our_identity_wire = wire_key_33(&self.identity.public_bytes());
 
         let mut wire_keys = Vec::with_capacity(peer_devices.len());
         for &did in &peer_devices
@@ -342,28 +348,63 @@ impl OmemoController
                 None => continue,
             };
 
-            let enc = session.encrypt(&key_with_tag)?;
-            let mut key_bytes = Vec::with_capacity(8 + 4 + enc.wrapped_key.len() + 32);
-            // Encode the header as a small TLV prefix so the receiver
-            // knows the ratchet state to use. Wire format:
-            //   header_dh_pub (32 B) || n (4 B BE) || pn (4 B BE) || wrapped_key
-            key_bytes.extend_from_slice(&enc.header_dh_pub);
-            key_bytes.extend_from_slice(&enc.n.to_be_bytes());
-            key_bytes.extend_from_slice(&enc.pn.to_be_bytes());
-            key_bytes.extend_from_slice(&enc.wrapped_key);
+            // Look up the peer identity we recorded during X3DH.
+            let peer_identity_raw = match self.store.trust(peer_jid, did)
+            {
+                Some((_, key)) => key,
+                None => continue, // shouldn't happen if ensure_session ran
+            };
+            let peer_identity_wire = wire_key_33(&peer_identity_raw);
 
-            let is_prekey = self.store.session(peer_jid, did)
-                .and_then(|s| s.pending_pre_key.as_ref().map(|_| true))
-                .unwrap_or(false);
+            // Ratchet step yields the message key plus the header info
+            // (ratchet pub + counters) we'll embed in the WhisperMessage.
+            let step = session.ratchet.encrypt()?;
+            let (cipher_key, mac_key, cbc_iv) = derive_message_keys(&step.message_key)?;
+            let inner_ct = aes256_cbc_encrypt(&cipher_key, &cbc_iv, &key_with_tag);
+
+            let whisper = SignalMessage
+            {
+                ratchet_key_wire: wire_key_33(&step.header_dh_pub).to_vec(),
+                counter: step.n,
+                previous_counter: step.pn,
+                ciphertext: inner_ct,
+            };
+
+            let inner_envelope = encode_signal_message(
+                &mac_key,
+                &our_identity_wire,
+                &peer_identity_wire,
+                &whisper,
+            );
+
+            let pending = session.pending_pre_key.clone();
+            let wire_bytes = if let Some(p) = pending
+            {
+                let prekey_msg = PreKeySignalMessage
+                {
+                    registration_id: p.registration_id,
+                    pre_key_id: p.used_one_time_pre_key_id,
+                    signed_pre_key_id: p.used_signed_pre_key_id,
+                    base_key_wire: wire_key_33(&p.ephemeral_key_pub).to_vec(),
+                    identity_key_wire: wire_key_33(&p.identity_key_pub).to_vec(),
+                    inner_message_bytes: inner_envelope,
+                };
+                encode_prekey_message(&prekey_msg)
+            }
+            else
+            {
+                inner_envelope
+            };
+
+            let is_prekey = session.pending_pre_key.is_some();
 
             wire_keys.push(OmemoKey
             {
                 rid: did,
                 prekey: is_prekey,
-                data_b64: B64.encode(&key_bytes),
+                data_b64: B64.encode(&wire_bytes),
             });
 
-            // Persist updated ratchet state.
             self.store.put_session(peer_jid, did, session);
         }
 
@@ -384,8 +425,8 @@ impl OmemoController
     }
 
     /// Decrypt an inbound OMEMO message. Returns `Ok(Some(plaintext))`
-    /// if a `<key>` targeted at our device id was found and decryption
-    /// succeeded.
+    /// when a `<key>` targeted at our device id was found and the inner
+    /// libsignal envelope decrypted successfully.
     pub fn decrypt_from_peer(
         &mut self,
         peer_jid: &str,
@@ -399,51 +440,89 @@ impl OmemoController
             None => return Ok(None),
         };
 
-        let key_bytes = B64.decode(&key.data_b64).map_err(|e| OmemoError::Base64(e.to_string()))?;
-        if key_bytes.len() < 32 + 4 + 4 + 32
-        {
-            return Err(OmemoError::InvalidStanza(format!(
-                "wrapped key too short ({} bytes)", key_bytes.len()
-            )));
-        }
-        let mut header_dh_pub = [0u8; 32];
-        header_dh_pub.copy_from_slice(&key_bytes[..32]);
-        let n = u32::from_be_bytes(key_bytes[32..36].try_into().unwrap());
-        let pn = u32::from_be_bytes(key_bytes[36..40].try_into().unwrap());
-        let wrapped = &key_bytes[40..];
+        let wrapped_bytes = B64.decode(&key.data_b64)
+            .map_err(|e| OmemoError::Base64(e.to_string()))?;
 
-        // For a pre-key message, run responder X3DH first. We detect a
-        // pre-key by both:
-        //  - the wire attribute `prekey='true'`, AND
-        //  - the absence of an existing session for (peer_jid, sid).
-        let mut session = match self.store.session(peer_jid, encrypted.sid)
+        // Unwrap a possible PreKeyWhisperMessage envelope. If we end up
+        // with a fresh responder session it gets stored before the
+        // ratchet decrypt step.
+        let (inner_envelope, peer_identity_raw, established_session) = if key.prekey
         {
-            Some(s) => s,
-            None =>
+            let prekey = decode_prekey_message(&wrapped_bytes)
+                .map_err(|e| OmemoError::InvalidStanza(format!("prekey envelope: {}", e)))?;
+            let peer_identity = strip_djb_prefix(&prekey.identity_key_wire)
+                .map_err(|e| OmemoError::InvalidStanza(format!("identity_key: {}", e)))?;
+            let peer_base = strip_djb_prefix(&prekey.base_key_wire)
+                .map_err(|e| OmemoError::InvalidStanza(format!("base_key: {}", e)))?;
+
+            // Build the responder session using the SPK/OTPK ids the
+            // initiator told us about.
+            let session = match self.store.session(peer_jid, encrypted.sid)
             {
-                if !key.prekey
-                {
-                    return Err(OmemoError::InvalidStanza(
-                        "no session and not a prekey message".into(),
-                    ));
-                }
-                self.build_responder_session(&header_dh_pub)?
-            }
+                Some(s) => s,
+                None => self.build_responder_session(
+                    prekey.signed_pre_key_id,
+                    prekey.pre_key_id,
+                    peer_identity,
+                    peer_base,
+                )?,
+            };
+            (prekey.inner_message_bytes, peer_identity, session)
+        }
+        else
+        {
+            let session = self.store.session(peer_jid, encrypted.sid)
+                .ok_or_else(|| OmemoError::InvalidStanza(
+                    "no session and not a prekey message".into()
+                ))?;
+            let peer_identity = self.store.trust(peer_jid, encrypted.sid)
+                .map(|(_, k)| k)
+                .unwrap_or([0u8; 32]);
+            (wrapped_bytes, peer_identity, session)
         };
 
-        let recovered = session.decrypt(header_dh_pub, n, pn, wrapped)?;
-        self.store.put_session(peer_jid, encrypted.sid, session);
+        let our_identity_wire = wire_key_33(&self.identity.public_bytes());
+        let peer_identity_wire = wire_key_33(&peer_identity_raw);
 
-        // Trust on first use.
-        if self.store.trust(peer_jid, encrypted.sid).is_none()
+        // Derive the message key first via the ratchet step so we can
+        // verify the MAC and decrypt the inner ciphertext.
+        let mut session = established_session;
+
+        // Peek into the WhisperMessage protobuf to extract header info
+        // (ratchet pub + counters) before MAC validation, then re-derive
+        // keys, then validate MAC + decrypt.
+        let (ratchet_pub, n, pn, _ct_unused) = peek_whisper_header(&inner_envelope)?;
+
+        let message_key = session.ratchet.decrypt(ratchet_pub, n, pn)?;
+        let (cipher_key, mac_key, cbc_iv) = derive_message_keys(&message_key)?;
+
+        let whisper = decode_signal_message(
+            &inner_envelope,
+            &mac_key,
+            &peer_identity_wire,
+            &our_identity_wire,
+        ).map_err(|e| OmemoError::InvalidStanza(format!("decrypt envelope: {}", e)))?;
+
+        let key_with_tag = aes256_cbc_decrypt(&cipher_key, &cbc_iv, &whisper.ciphertext)
+            .map_err(|e| OmemoError::InvalidStanza(format!("cbc decrypt: {}", e)))?;
+        if key_with_tag.len() != 32
         {
-            // We don't know the peer's identity key for sure here unless
-            // a future "header" extension carries it. For TOFU we just
-            // record a placeholder so the UI can prompt the user.
-            self.store.set_trust(peer_jid, encrypted.sid, Trust::Tofu, [0u8; 32]);
+            return Err(OmemoError::InvalidStanza(format!(
+                "expected 32-byte key+tag, got {}", key_with_tag.len()
+            )));
         }
 
-        // Decrypt the actual payload (if any) using the recovered key.
+        // Successful unwrap → drop any pending pre-key state.
+        session.pending_pre_key = None;
+        self.store.put_session(peer_jid, encrypted.sid, session);
+
+        // Trust on first use: record the peer identity we learned from
+        // the prekey envelope (or the existing trust entry's value).
+        if self.store.trust(peer_jid, encrypted.sid).is_none()
+        {
+            self.store.set_trust(peer_jid, encrypted.sid, Trust::Tofu, peer_identity_raw);
+        }
+
         let payload_b64 = match &encrypted.payload_b64
         {
             Some(p) => p,
@@ -465,8 +544,8 @@ impl OmemoController
 
         let mut key16 = [0u8; OMEMO_AES_KEY_LEN];
         let mut tag = [0u8; OMEMO_AES_TAG_LEN];
-        key16.copy_from_slice(&recovered[..OMEMO_AES_KEY_LEN]);
-        tag.copy_from_slice(&recovered[OMEMO_AES_KEY_LEN..]);
+        key16.copy_from_slice(&key_with_tag[..OMEMO_AES_KEY_LEN]);
+        tag.copy_from_slice(&key_with_tag[OMEMO_AES_KEY_LEN..]);
 
         let mut iv12 = [0u8; OMEMO_AES_IV_LEN];
         iv12.copy_from_slice(&iv);
@@ -484,30 +563,33 @@ impl OmemoController
 
     fn build_responder_session(
         &mut self,
-        peer_ephemeral_pub: &[u8; 32],
+        signed_pre_key_id: u32,
+        pre_key_id: Option<u32>,
+        peer_identity_raw: [u8; 32],
+        peer_ephemeral_pub: [u8; 32],
     ) -> Result<Session, OmemoError>
     {
-        // For the responder we don't yet know which OTPK the initiator
-        // consumed without parsing a SignalProtocol PreKeyMessage header;
-        // since our wire format doesn't carry the SPK/OTPK ids inline,
-        // we fall back to using the currently active SPK and try the
-        // most recently issued OTPK. This is interop-fragile and is
-        // explicitly called out in the module's status notes.
-        //
-        // A future revision should embed (spk_id, otpk_id, identity_pub,
-        // ephemeral_pub) inside the wrapped key as a libsignal-compatible
-        // PreKeyWhisperMessage. See `decrypt_from_peer` for the matching
-        // format.
+        if signed_pre_key_id != self.signed_pre_key.id
+        {
+            return Err(OmemoError::BadBundle);
+        }
+
         let spk = self.signed_pre_key.clone();
-        let otpk = self.one_time_pre_keys.last().cloned();
+        let otpk = match pre_key_id
+        {
+            Some(id) => self.store.take_one_time_pre_key(id).or_else(||
+                self.one_time_pre_keys.iter().find(|p| p.id == id).cloned()
+            ),
+            None => None,
+        };
 
         let sk = responder_x3dh(&ResponderInputs
         {
             identity: &self.identity.keypair,
             signed_pre_key: &spk.keypair,
             one_time_pre_key: otpk.as_ref().map(|p| &p.keypair),
-            peer_identity_key: [0u8; 32], // unknown — see note above
-            peer_ephemeral_key: *peer_ephemeral_pub,
+            peer_identity_key: peer_identity_raw,
+            peer_ephemeral_key: peer_ephemeral_pub,
         })?;
 
         let ratchet = RatchetState::init_responder(
@@ -518,15 +600,100 @@ impl OmemoController
 
         let session = Session { ratchet, pending_pre_key: None };
 
-        // Consume the OTPK.
         if let Some(p) = otpk
         {
-            let _ = self.store.take_one_time_pre_key(p.id);
             self.one_time_pre_keys.retain(|x| x.id != p.id);
         }
 
         return Ok(session);
     }
+}
+
+fn peek_whisper_header(envelope: &[u8]) -> Result<([u8; 32], u32, u32, ()), OmemoError>
+{
+    if envelope.len() < 1 + 8
+    {
+        return Err(OmemoError::InvalidStanza("envelope too short".into()));
+    }
+    let proto = &envelope[1..envelope.len() - 8];
+    let mut pos = 0;
+    let mut ratchet_key: Option<[u8; 32]> = None;
+    let mut counter: u32 = 0;
+    let mut previous_counter: u32 = 0;
+
+    while pos < proto.len()
+    {
+        let (tag, used) = read_varint(&proto[pos..])?;
+        pos += used;
+        let field = (tag >> 3) as u32;
+        let wire = (tag & 0x07) as u8;
+
+        match (field, wire)
+        {
+            (1, 2) =>
+            {
+                let (len, used) = read_varint(&proto[pos..])?;
+                pos += used;
+                let end = pos + len as usize;
+                let raw = proto.get(pos..end)
+                    .ok_or_else(|| OmemoError::InvalidStanza("truncated ratchet_key".into()))?;
+                ratchet_key = Some(strip_djb_prefix(raw)
+                    .map_err(|e| OmemoError::InvalidStanza(format!("{}", e)))?);
+                pos = end;
+            }
+            (2, 0) =>
+            {
+                let (v, used) = read_varint(&proto[pos..])?;
+                pos += used;
+                counter = v as u32;
+            }
+            (3, 0) =>
+            {
+                let (v, used) = read_varint(&proto[pos..])?;
+                pos += used;
+                previous_counter = v as u32;
+            }
+            (_, 0) =>
+            {
+                let (_, used) = read_varint(&proto[pos..])?;
+                pos += used;
+            }
+            (_, 2) =>
+            {
+                let (len, used) = read_varint(&proto[pos..])?;
+                pos += used;
+                pos = pos.saturating_add(len as usize).min(proto.len());
+            }
+            (_, _) =>
+            {
+                return Err(OmemoError::InvalidStanza("unknown wire type".into()));
+            }
+        }
+    }
+
+    let ratchet_key = ratchet_key.ok_or_else(||
+        OmemoError::InvalidStanza("missing ratchet_key".into())
+    )?;
+    return Ok((ratchet_key, counter, previous_counter, ()));
+}
+
+fn read_varint(buf: &[u8]) -> Result<(u64, usize), OmemoError>
+{
+    let mut shift = 0u32;
+    let mut result = 0u64;
+    let mut consumed = 0usize;
+    for &b in buf
+    {
+        consumed += 1;
+        result |= ((b & 0x7f) as u64) << shift;
+        if (b & 0x80) == 0 { return Ok((result, consumed)); }
+        shift += 7;
+        if shift > 63
+        {
+            return Err(OmemoError::InvalidStanza("varint overflow".into()));
+        }
+    }
+    return Err(OmemoError::InvalidStanza("varint truncated".into()));
 }
 
 fn decode_pubkey(b64: &str) -> Result<[u8; 32], OmemoError>
@@ -598,6 +765,115 @@ pub fn fingerprint_hex(public_key: &[u8; 32]) -> String
 mod tests
 {
     use super::*;
+    use crate::omemo::ratchet::RatchetState;
+    use crate::omemo::signal_message::{
+        decode_signal_message, encode_signal_message, encode_prekey_message,
+        decode_prekey_message, derive_message_keys, aes256_cbc_encrypt,
+        aes256_cbc_decrypt, PreKeySignalMessage, SignalMessage, wire_key_33,
+    };
+    use crate::omemo::x3dh::{ initiator_x3dh, responder_x3dh, PeerBundle, ResponderInputs };
+    use crate::omemo::crypto::{ xeddsa_sign, X25519KeyPair };
+
+    /// Whole pipeline: Alice X3DH → ratchet → libsignal envelope →
+    /// Bob parses PreKeyWhisperMessage → responder X3DH → ratchet →
+    /// recovers the inner 32-byte key+tag.
+    #[test]
+    fn libsignal_envelope_roundtrip_prekey()
+    {
+        let alice_id = X25519KeyPair::generate();
+        let bob_id = X25519KeyPair::generate();
+        let bob_spk = X25519KeyPair::generate();
+        let bob_opk = X25519KeyPair::generate();
+        let sig = xeddsa_sign(
+            &bob_id.private_bytes(),
+            &wire_key_33(&bob_spk.public_bytes()),
+        );
+
+        let peer = PeerBundle
+        {
+            identity_key: bob_id.public_bytes(),
+            signed_pre_key_id: 1,
+            signed_pre_key: bob_spk.public_bytes(),
+            signed_pre_key_sig: sig,
+            one_time_pre_key: Some((42, bob_opk.public_bytes())),
+        };
+
+        // Alice runs initiator X3DH.
+        let init = initiator_x3dh(&alice_id, &peer).unwrap();
+        let mut alice_ratchet = RatchetState::init_initiator(
+            init.shared_secret, peer.signed_pre_key
+        ).unwrap();
+
+        // Alice encrypts the 32-byte OMEMO key+tag.
+        let inner_plain = [7u8; 32];
+        let step = alice_ratchet.encrypt().unwrap();
+        let (cipher_key, mac_key, cbc_iv) = derive_message_keys(&step.message_key).unwrap();
+        let inner_ct = aes256_cbc_encrypt(&cipher_key, &cbc_iv, &inner_plain);
+
+        let alice_ik_wire = wire_key_33(&alice_id.public_bytes());
+        let bob_ik_wire = wire_key_33(&bob_id.public_bytes());
+
+        let whisper = SignalMessage
+        {
+            ratchet_key_wire: wire_key_33(&step.header_dh_pub).to_vec(),
+            counter: step.n,
+            previous_counter: step.pn,
+            ciphertext: inner_ct,
+        };
+
+        let inner_env = encode_signal_message(&mac_key, &alice_ik_wire, &bob_ik_wire, &whisper);
+
+        let prekey = PreKeySignalMessage
+        {
+            registration_id: 1,
+            pre_key_id: Some(42),
+            signed_pre_key_id: 1,
+            base_key_wire: wire_key_33(&init.ephemeral_key.public_bytes()).to_vec(),
+            identity_key_wire: alice_ik_wire.to_vec(),
+            inner_message_bytes: inner_env,
+        };
+
+        let wire = encode_prekey_message(&prekey);
+
+        // Bob receives and parses the PreKey envelope.
+        let parsed = decode_prekey_message(&wire).unwrap();
+        let peer_ik_raw = crate::omemo::signal_message::strip_djb_prefix(&parsed.identity_key_wire).unwrap();
+        let peer_base_raw = crate::omemo::signal_message::strip_djb_prefix(&parsed.base_key_wire).unwrap();
+        assert_eq!(peer_ik_raw, alice_id.public_bytes());
+        assert_eq!(parsed.signed_pre_key_id, 1);
+        assert_eq!(parsed.pre_key_id, Some(42));
+
+        // Bob runs responder X3DH with the keys named in the envelope.
+        let sk = responder_x3dh(&ResponderInputs
+        {
+            identity: &bob_id,
+            signed_pre_key: &bob_spk,
+            one_time_pre_key: Some(&bob_opk),
+            peer_identity_key: peer_ik_raw,
+            peer_ephemeral_key: peer_base_raw,
+        }).unwrap();
+        assert_eq!(sk, init.shared_secret);
+
+        let mut bob_ratchet = RatchetState::init_responder(
+            sk, bob_spk.private_bytes(), bob_spk.public_bytes(),
+        );
+
+        // Bob runs the ratchet step matching the header, then validates
+        // the MAC and decrypts AES-CBC.
+        let (rk, n, pn, _) = peek_whisper_header(&parsed.inner_message_bytes).unwrap();
+        let mk = bob_ratchet.decrypt(rk, n, pn).unwrap();
+        let (ck, mk2, iv) = derive_message_keys(&mk).unwrap();
+
+        let signal = decode_signal_message(
+            &parsed.inner_message_bytes,
+            &mk2,
+            &alice_ik_wire,
+            &bob_ik_wire,
+        ).unwrap();
+
+        let recovered = aes256_cbc_decrypt(&ck, &iv, &signal.ciphertext).unwrap();
+        assert_eq!(recovered, &inner_plain[..]);
+    }
 
     #[test]
     fn fingerprint_is_stable()

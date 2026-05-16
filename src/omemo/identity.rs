@@ -5,6 +5,7 @@ use serde::{ Deserialize, Serialize };
 use zeroize::Zeroize;
 
 use super::crypto::{ random_device_id, xeddsa_sign, X25519KeyPair };
+use super::signal_message::wire_key_33;
 
 /// Long-term identity key plus the device id we present to peers. Kept on
 /// disk in [`OmemoStore`](super::store::OmemoStore).
@@ -95,7 +96,10 @@ impl SignedPreKey
     pub fn generate(id: u32, identity: &IdentityKeyPair) -> Self
     {
         let kp = X25519KeyPair::generate();
-        let signature = xeddsa_sign(&identity.keypair.private_bytes(), &kp.public_bytes());
+        // Sign over the wire-form (DJB-prefixed) public key — this is
+        // the layout libsignal expects so other OMEMO clients verify it.
+        let wire = wire_key_33(&kp.public_bytes());
+        let signature = xeddsa_sign(&identity.keypair.private_bytes(), &wire);
         return Self { id, keypair: kp, signature };
     }
 }
@@ -197,12 +201,13 @@ mod tests
         let id = IdentityKeyPair::generate();
         let spk = SignedPreKey::generate(1, &id);
 
+        let wire = wire_key_33(&spk.keypair.public_bytes());
         xeddsa_verify(
             &id.keypair.public_bytes(),
-            &spk.keypair.public_bytes(),
+            &wire,
             &spk.signature,
         )
-        .expect("signed prekey signature should verify under the identity key");
+        .expect("signed prekey signature should verify under the identity key (wire form)");
     }
 
     #[test]
