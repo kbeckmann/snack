@@ -1,5 +1,5 @@
 use iced::{ Task, Theme };
-use iced::widget::Id;
+use iced::widget::{ text_editor, Id };
 
 use crate::message::Message;
 use crate::{ room, storage, xmpp };
@@ -64,7 +64,7 @@ pub struct Snack
     pub(crate) rooms: Vec<room::Room>,
     pub(crate) chats: Vec<room::chat::Chat>,
     pub(crate) active: Option<Selection>,
-    pub(crate) message_input: String,
+    pub(crate) message_input: text_editor::Content,
     pub(crate) show_join_panel: bool,
     pub(crate) joining_room: Option<String>,
     pub(crate) join_error: Option<String>,
@@ -97,7 +97,7 @@ impl Snack
             rooms: Vec::new(),
             chats: Vec::new(),
             active: None,
-            message_input: String::new(),
+            message_input: text_editor::Content::new(),
             show_join_panel: false,
             joining_room: None,
             join_error: None,

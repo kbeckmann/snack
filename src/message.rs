@@ -1,3 +1,5 @@
+use iced::widget::text_editor;
+
 use crate::xmpp;
 
 #[derive(Debug, Clone)]
@@ -20,7 +22,7 @@ pub enum Message
     SelectRoom(usize),
     SelectChat(usize),
     StartChat(String),
-    InputChanged(String),
+    InputAction(text_editor::Action),
     SendMessage,
     ShowJoinPanel,
     HideJoinPanel,

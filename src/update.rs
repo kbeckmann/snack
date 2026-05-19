@@ -1,5 +1,5 @@
 use iced::Task;
-use iced::widget::Id;
+use iced::widget::{ text_editor, Id };
 use log::{ error, warn };
 
 use crate::app::{
@@ -107,9 +107,10 @@ impl Snack
         };
 
         // Resume an in-progress cycle only if the input wasn't edited in between.
+        let current_input = self.message_input.text();
         let mut state = self.nick_complete
             .take()
-            .filter(|s| s.last_output == self.message_input);
+            .filter(|s| s.last_output == current_input);
 
         if let Some(ref mut s) = state
         {
@@ -126,7 +127,7 @@ impl Snack
         {
             // Start a fresh cycle: find the partial word at the end of the input
             // (whitespace-delimited) and gather all matching nicks alphabetically.
-            let input = &self.message_input;
+            let input = &current_input;
             let prefix_start = input
                 .char_indices()
                 .rev()
@@ -166,13 +167,16 @@ impl Snack
         let mut state = state.expect("state populated above");
         let nick = &state.matches[state.index];
         let suffix = if state.prefix_start == 0 { ": " } else { " " };
-        let new_input = format!("{}{}{}", &self.message_input[..state.prefix_start], nick, suffix);
+        let new_input = format!("{}{}{}", &current_input[..state.prefix_start], nick, suffix);
 
-        self.message_input = new_input.clone();
+        self.message_input = text_editor::Content::with_text(&new_input);
+        self.message_input.perform(text_editor::Action::Move(
+            iced::widget::text_editor::Motion::DocumentEnd,
+        ));
         state.last_output = new_input;
         self.nick_complete = Some(state);
 
-        return iced::widget::operation::move_cursor_to_end(Id::new(MESSAGE_INPUT_ID));
+        return iced::widget::operation::focus(Id::new(MESSAGE_INPUT_ID));
     }
 
     pub(crate) fn update(&mut self, message: Message) -> Task<Message>
@@ -373,7 +377,7 @@ impl Snack
                         self.rooms.clear();
                         self.chats.clear();
                         self.active = None;
-                        self.message_input.clear();
+                        self.message_input = text_editor::Content::new();
                         self.show_join_panel = false;
                         self.joining_room = None;
                         self.join_error = None;
@@ -684,7 +688,7 @@ impl Snack
                 self.rooms.clear();
                 self.chats.clear();
                 self.active = None;
-                self.message_input.clear();
+                self.message_input = text_editor::Content::new();
                 self.show_join_panel = false;
                 self.joining_room = None;
                 self.join_error = None;
@@ -759,17 +763,22 @@ impl Snack
 
                 return Task::done(Message::SelectChat(idx));
             }
-            Message::InputChanged(value) =>
+            Message::InputAction(action) =>
             {
-                if self.nick_complete.as_ref().is_some_and(|s| s.last_output != value)
+                let is_edit = action.is_edit();
+                self.message_input.perform(action);
+                if is_edit
                 {
-                    self.nick_complete = None;
+                    let text = self.message_input.text();
+                    if self.nick_complete.as_ref().is_some_and(|s| s.last_output != text)
+                    {
+                        self.nick_complete = None;
+                    }
                 }
-                self.message_input = value;
             }
             Message::SendMessage =>
             {
-                let body = self.message_input.trim().to_string();
+                let body = self.message_input.text().trim().to_string();
 
                 if body.is_empty()
                 {
@@ -793,7 +802,7 @@ impl Snack
                             }
                         }
 
-                        self.message_input.clear();
+                        self.message_input = text_editor::Content::new();
                         self.nick_complete = None;
 
                         return Task::batch([snap_to_bottom(), focus_input()]);
@@ -838,7 +847,7 @@ impl Snack
                             }
                         }
 
-                        self.message_input.clear();
+                        self.message_input = text_editor::Content::new();
                         self.nick_complete = None;
 
                         return Task::batch([snap_to_bottom(), focus_input()]);

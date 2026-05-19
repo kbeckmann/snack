@@ -1,5 +1,6 @@
 use iced::{ Color, Element, Fill, Length };
-use iced::widget::{ button, column, container, rich_text, row, scrollable, span, text, text_input, Id };
+use iced::keyboard;
+use iced::widget::{ button, column, container, rich_text, row, scrollable, span, text, text_editor, Id };
 
 use crate::{ Message, Selection, Snack, MESSAGE_SCROLL_ID, MESSAGE_INPUT_ID };
 use crate::room::message::{ Message as RoomMessage, EventKind };
@@ -204,18 +205,37 @@ fn render_messages<'a>(
 
 fn input_row(state: &Snack) -> Element<'_, Message>
 {
-    let input = text_input("Type a message...", &state.message_input)
+    let input = text_editor(&state.message_input)
         .id(Id::new(MESSAGE_INPUT_ID))
-        .on_input(Message::InputChanged)
-        .on_submit(Message::SendMessage)
+        .placeholder("Type a message...")
+        .on_action(Message::InputAction)
+        .key_binding(|press|
+        {
+            // Plain Enter sends the message. Alt+Enter (and Shift+Enter as a
+            // common alternative) inserts a newline instead.
+            if matches!(press.key, keyboard::Key::Named(keyboard::key::Named::Enter))
+            {
+                if press.modifiers.alt() || press.modifiers.shift()
+                {
+                    return Some(text_editor::Binding::Enter);
+                }
+                return Some(text_editor::Binding::Custom(Message::SendMessage));
+            }
+            return text_editor::Binding::from_key_press(press);
+        })
         .padding(10)
-        .width(Fill);
+        .height(Length::Shrink)
+        .max_height(160.0);
 
     let send_btn = button(text("Send").size(14))
         .on_press(Message::SendMessage)
         .padding(10);
 
-    return row![input, send_btn].spacing(8).width(Fill).into();
+    return row![input, send_btn]
+        .align_y(iced::Alignment::End)
+        .spacing(8)
+        .width(Fill)
+        .into();
 }
 
 pub fn view(state: &Snack) -> Element<'_, Message>
