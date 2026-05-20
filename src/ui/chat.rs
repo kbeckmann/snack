@@ -221,6 +221,21 @@ fn input_row(state: &Snack) -> Element<'_, Message>
                 }
                 return Some(text_editor::Binding::Custom(Message::SendMessage));
             }
+            // Alt+Up/Down navigates between selections. The editor would
+            // otherwise capture the arrow keys to move the cursor between
+            // lines, so the global keyboard subscription never sees them.
+            if press.modifiers.alt() && !press.modifiers.shift()
+                && !press.modifiers.control() && !press.modifiers.command()
+            {
+                if matches!(press.key, keyboard::Key::Named(keyboard::key::Named::ArrowUp))
+                {
+                    return Some(text_editor::Binding::Custom(Message::PrevSelection));
+                }
+                if matches!(press.key, keyboard::Key::Named(keyboard::key::Named::ArrowDown))
+                {
+                    return Some(text_editor::Binding::Custom(Message::NextSelection));
+                }
+            }
             return text_editor::Binding::from_key_press(press);
         })
         .padding(10)
