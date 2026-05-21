@@ -78,6 +78,14 @@ pub struct Snack
     pub(crate) auto_login_attempt: bool,
     pub(crate) nick_complete: Option<NickCompleteState>,
     pub(crate) window_focused: bool,
+    // Auto-reconnect: when an established session drops (e.g. after the laptop
+    // wakes from sleep) we transparently retry with exponential backoff instead
+    // of dumping the user back to the login screen. Credentials are stashed so
+    // the retry can rebuild the command channel without re-prompting.
+    pub(crate) reconnecting: bool,
+    pub(crate) reconnect_attempts: u32,
+    pub(crate) reconnect_jid: Option<String>,
+    pub(crate) reconnect_password: Option<String>,
 }
 
 impl Snack
@@ -111,6 +119,10 @@ impl Snack
             auto_login_attempt: false,
             nick_complete: None,
             window_focused: true,
+            reconnecting: false,
+            reconnect_attempts: 0,
+            reconnect_jid: None,
+            reconnect_password: None,
         };
 
         // Auto-login: if a keyring entry exists for the saved JID, connect silently.

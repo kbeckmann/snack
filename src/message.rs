@@ -16,6 +16,7 @@ pub enum Message
     SaveRoomToggled(bool),
     FocusPassword,
     Connect,
+    Reconnect,
     CancelConnect,
     XmppEvent(xmpp::XmppEvent),
     Disconnect,
