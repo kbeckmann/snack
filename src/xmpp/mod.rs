@@ -129,10 +129,40 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                     }
                 };
 
+                // Heartbeat used purely to detect that the machine was
+                // suspended (e.g. laptop lid closed). libxmpp 0.1.3 exposes no
+                // ping/keepalive, so when the host sleeps the TCP socket goes
+                // half-open: reads block forever and no Disconnected is ever
+                // emitted, leaving the UI "connected" to a dead socket. By
+                // comparing wall-clock time between ticks we notice the gap on
+                // wake and tear the connection down so the app can reconnect.
+                let mut heartbeat = tokio::time::interval(std::time::Duration::from_secs(30));
+                heartbeat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                let mut last_beat = std::time::SystemTime::now();
+
                 loop
                 {
                     tokio::select!
                     {
+                        _ = heartbeat.tick() =>
+                        {
+                            // The first tick fires immediately; later ticks are
+                            // ~30s apart. A much larger wall-clock gap means we
+                            // were suspended.
+                            let now = std::time::SystemTime::now();
+                            let elapsed = now.duration_since(last_beat).unwrap_or_default();
+                            last_beat = now;
+
+                            if elapsed > std::time::Duration::from_secs(90)
+                            {
+                                log::warn!(
+                                    "Wall-clock jumped {}s between heartbeats; assuming wake from sleep.",
+                                    elapsed.as_secs()
+                                );
+                                let _ = bridge_tx.send(XmppEvent::Disconnected("Connection lost after sleep.".to_string())).await;
+                                break;
+                            }
+                        }
                         event = event_rx.recv() =>
                         {
                             match event
@@ -203,46 +233,62 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                         }
                         cmd = cmd_rx.recv() =>
                         {
-                            match cmd
+                            // Each command boils down to a socket write. A write
+                            // error means the transport is gone, so surface it as
+                            // a disconnect and stop — the UI then reconnects
+                            // rather than silently dropping the command.
+                            let write_err = match cmd
                             {
                                 Some(XmppCommand::JoinRoom(room_jid)) =>
                                 {
                                     debug!("XmppCommand::JoinRoom room={} nick={}", room_jid, nick);
-                                    if let Err(e) = client.join_room(&room_jid, &nick).await
+                                    match client.join_room(&room_jid, &nick).await
                                     {
-                                        error!("join_room({}) failed: {}", room_jid, e);
-                                        let _ = bridge_tx.send(XmppEvent::RoomJoinFailed
+                                        Ok(()) => None,
+                                        Err(e) =>
                                         {
-                                            room: room_jid,
-                                            reason: e.to_string(),
-                                        }).await;
+                                            error!("join_room({}) failed: {}", room_jid, e);
+                                            let _ = bridge_tx.send(XmppEvent::RoomJoinFailed
+                                            {
+                                                room: room_jid,
+                                                reason: e.to_string(),
+                                            }).await;
+                                            Some(e)
+                                        }
                                     }
                                 }
                                 Some(XmppCommand::SendRoomMessage { room, body }) =>
                                 {
                                     debug!("XmppCommand::SendRoomMessage room={} len={}", room, body.len());
-                                    if let Err(e) = client.send_room_message(&room, &body).await
+                                    client.send_room_message(&room, &body).await.err().inspect(|e|
                                     {
                                         error!("send_room_message({}) failed: {}", room, e);
-                                    }
+                                    })
                                 }
                                 Some(XmppCommand::LeaveRoom { room, nick }) =>
                                 {
                                     debug!("XmppCommand::LeaveRoom room={} nick={}", room, nick);
-                                    if let Err(e) = client.leave_room(&room, &nick).await
+                                    client.leave_room(&room, &nick).await.err().inspect(|e|
                                     {
                                         error!("leave_room({}) failed: {}", room, e);
-                                    }
+                                    })
                                 }
                                 Some(XmppCommand::SendDirectMessage { to, body }) =>
                                 {
                                     debug!("XmppCommand::SendDirectMessage to={} len={}", to, body.len());
-                                    if let Err(e) = client.send_message(&to, &body).await
+                                    client.send_message(&to, &body).await.err().inspect(|e|
                                     {
                                         error!("send_message({}) failed: {}", to, e);
-                                    }
+                                    })
                                 }
                                 None => break,
+                            };
+
+                            if let Some(e) = write_err
+                            {
+                                error!("Command write failed, connection lost: {}", e);
+                                let _ = bridge_tx.send(XmppEvent::Disconnected(format!("Connection lost: {}", e))).await;
+                                break;
                             }
                         }
                     }

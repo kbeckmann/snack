@@ -21,6 +21,45 @@ fn send_notification(summary: &str, body: &str)
     }
 }
 
+// Delay before the Nth reconnect attempt: exponential backoff capped at 60s,
+// with jitter in the range [50%, 100%] of the target so reconnecting clients
+// don't retry in lockstep against a server that's already under load. `attempt`
+// is 1-based.
+fn reconnect_delay(attempt: u32) -> std::time::Duration
+{
+    const BASE_MS: u64 = 1_000;
+    const CAP_MS: u64 = 60_000;
+
+    let shift = attempt.saturating_sub(1).min(6);
+    let target = (BASE_MS << shift).min(CAP_MS);
+    let half = target / 2;
+
+    // Cheap jitter from the clock avoids pulling in an RNG dependency.
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.subsec_nanos() as u64)
+        .unwrap_or(0);
+    let jitter = if half > 0 { nanos % half } else { 0 };
+
+    return std::time::Duration::from_millis(half + jitter);
+}
+
+// Produce a Task that emits `msg` after `delay`. iced's default executor has no
+// async timer, so a short-lived thread parks and resolves a oneshot; this keeps
+// the delay independent of which executor iced is built with.
+fn delay_then(delay: std::time::Duration, msg: Message) -> Task<Message>
+{
+    let (tx, rx) = iced::futures::channel::oneshot::channel::<()>();
+
+    std::thread::spawn(move ||
+    {
+        std::thread::sleep(delay);
+        let _ = tx.send(());
+    });
+
+    return Task::perform(async move { let _ = rx.await; }, move |_| msg.clone());
+}
+
 impl Snack
 {
     // When switching away from the currently active room/chat to `next`, stamp
@@ -273,11 +312,49 @@ impl Snack
                 self.connect_error = None;
                 self.pending_save_password = Some(password.clone());
 
+                // Stash credentials so an automatic reconnect can rebuild the
+                // command channel without re-prompting. Reset any prior backoff.
+                self.reconnect_jid = Some(jid.clone());
+                self.reconnect_password = Some(password.clone());
+                self.reconnecting = false;
+                self.reconnect_attempts = 0;
+
                 let (cmd_tx, cmd_rx) = xmpp::new_command_channel(jid, password);
                 self.xmpp_cmd_tx = Some(cmd_tx);
                 self.xmpp_cmd_rx = Some(cmd_rx);
 
                 self.state = AppState::Connecting;
+
+                return Task::none();
+            }
+            Message::Reconnect =>
+            {
+                // Ignore stale timers (user logged out, or a reconnect already
+                // succeeded before this fired).
+                if !self.reconnecting
+                {
+                    return Task::none();
+                }
+
+                let creds = self.reconnect_jid.clone().zip(self.reconnect_password.clone());
+                let (jid, password) = match creds
+                {
+                    Some(c) => c,
+                    None =>
+                    {
+                        self.reconnecting = false;
+                        return Task::none();
+                    }
+                };
+
+                warn!("Reconnecting to {} (attempt {})...", jid, self.reconnect_attempts);
+
+                // A fresh command channel restarts the xmpp subscription, which
+                // is keyed on the channel identity. State stays Connected so the
+                // chat UI remains visible; `reconnecting` drives the banner.
+                let (cmd_tx, cmd_rx) = xmpp::new_command_channel(jid, password);
+                self.xmpp_cmd_tx = Some(cmd_tx);
+                self.xmpp_cmd_rx = Some(cmd_rx);
 
                 return Task::none();
             }
@@ -290,6 +367,10 @@ impl Snack
                 self.pending_save_password = None;
                 self.auto_login_attempt = false;
                 self.connect_error = None;
+                self.reconnecting = false;
+                self.reconnect_attempts = 0;
+                self.reconnect_jid = None;
+                self.reconnect_password = None;
 
                 return focus_jid_input();
             }
@@ -305,6 +386,8 @@ impl Snack
                         self.password_input.clear();
                         self.state = AppState::Connected;
                         self.auto_login_attempt = false;
+                        self.reconnecting = false;
+                        self.reconnect_attempts = 0;
 
                         let jid = self.connected_jid.clone().unwrap_or_default();
 
@@ -344,12 +427,23 @@ impl Snack
                             log::warn!("Failed to save config: {}", e);
                         }
 
-                        // Auto-join any saved rooms.
+                        // Auto-join saved rooms, plus any rooms we were already
+                        // in (so an automatic reconnect restores the session,
+                        // not just the persisted rooms).
                         if let Some(ref tx) = self.xmpp_cmd_tx
                         {
-                            for room_jid in &self.saved_config.rooms
+                            let mut to_join = self.saved_config.rooms.clone();
+                            for room in &self.rooms
                             {
-                                let _ = tx.try_send(xmpp::XmppCommand::JoinRoom(room_jid.clone()));
+                                if !to_join.contains(&room.jid)
+                                {
+                                    to_join.push(room.jid.clone());
+                                }
+                            }
+
+                            for room_jid in to_join
+                            {
+                                let _ = tx.try_send(xmpp::XmppCommand::JoinRoom(room_jid));
                             }
                         }
 
@@ -359,7 +453,42 @@ impl Snack
                     {
                         error!("Disconnected: {}", reason);
 
-                        // If an auto-login attempt failed, the saved password is likely
+                        // An established session that drops (laptop sleep,
+                        // network blip, server restart) reconnects transparently
+                        // with exponential backoff instead of dumping the user
+                        // back to the login screen. Authentication failures are
+                        // never retried — the credentials are wrong, so looping
+                        // would only hammer the server.
+                        let fatal = reason.to_lowercase().contains("auth");
+                        let have_creds = self.reconnect_jid.is_some()
+                            && self.reconnect_password.is_some();
+                        let established = self.state == AppState::Connected;
+
+                        if established && !fatal && have_creds
+                        {
+                            self.reconnecting = true;
+                            self.reconnect_attempts = self.reconnect_attempts.saturating_add(1);
+                            let delay = reconnect_delay(self.reconnect_attempts);
+
+                            // Drop the dead channel so the stale subscription
+                            // stops; the timer rebuilds it. Keep rooms, chats and
+                            // the active selection so the UI stays put.
+                            self.xmpp_cmd_tx = None;
+                            self.xmpp_cmd_rx = None;
+                            self.connect_error = None;
+
+                            warn!(
+                                "Connection lost ({}). Reconnecting in {:.1}s (attempt {}).",
+                                reason,
+                                delay.as_secs_f64(),
+                                self.reconnect_attempts
+                            );
+
+                            return delay_then(delay, Message::Reconnect);
+                        }
+
+                        // Otherwise fall back to the login screen. If an
+                        // auto-login attempt failed, the saved password is likely
                         // stale. Delete it so we don't loop on it next launch.
                         if self.auto_login_attempt
                         {
@@ -386,6 +515,10 @@ impl Snack
                         self.xmpp_cmd_rx = None;
                         self.pending_save_password = None;
                         self.auto_login_attempt = false;
+                        self.reconnecting = false;
+                        self.reconnect_attempts = 0;
+                        self.reconnect_jid = None;
+                        self.reconnect_password = None;
 
                         return focus_jid_input();
                     }
@@ -689,6 +822,11 @@ impl Snack
                 self.join_input.clear();
                 self.xmpp_cmd_tx = None;
                 self.xmpp_cmd_rx = None;
+                // Explicit logout: cancel any pending auto-reconnect.
+                self.reconnecting = false;
+                self.reconnect_attempts = 0;
+                self.reconnect_jid = None;
+                self.reconnect_password = None;
 
                 return focus_jid_input();
             }
@@ -775,6 +913,13 @@ impl Snack
                 if body.is_empty()
                 {
                     return Task::none();
+                }
+
+                // No live channel (e.g. waiting to reconnect): keep the user's
+                // text rather than silently discarding it.
+                if self.xmpp_cmd_tx.is_none()
+                {
+                    return focus_input();
                 }
 
                 match self.active
