@@ -1,6 +1,6 @@
 use iced::futures::SinkExt;
 use iced::stream;
-use log::error;
+use log::{ debug, error };
 use std::sync::{ Arc, Mutex };
 
 #[derive(Debug)]
@@ -139,6 +139,7 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                             {
                                 Some(ev) =>
                                 {
+                                    debug!("libxmpp event: {:?}", ev);
                                     let mapped = match ev
                                     {
                                         ::xmpp::XmppEvent::Connected => Some(XmppEvent::Connected),
@@ -206,8 +207,10 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                             {
                                 Some(XmppCommand::JoinRoom(room_jid)) =>
                                 {
+                                    debug!("XmppCommand::JoinRoom room={} nick={}", room_jid, nick);
                                     if let Err(e) = client.join_room(&room_jid, &nick).await
                                     {
+                                        error!("join_room({}) failed: {}", room_jid, e);
                                         let _ = bridge_tx.send(XmppEvent::RoomJoinFailed
                                         {
                                             room: room_jid,
@@ -217,23 +220,26 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                                 }
                                 Some(XmppCommand::SendRoomMessage { room, body }) =>
                                 {
+                                    debug!("XmppCommand::SendRoomMessage room={} len={}", room, body.len());
                                     if let Err(e) = client.send_room_message(&room, &body).await
                                     {
-                                        error!("Failed to send message: {}", e);
+                                        error!("send_room_message({}) failed: {}", room, e);
                                     }
                                 }
                                 Some(XmppCommand::LeaveRoom { room, nick }) =>
                                 {
+                                    debug!("XmppCommand::LeaveRoom room={} nick={}", room, nick);
                                     if let Err(e) = client.leave_room(&room, &nick).await
                                     {
-                                        error!("Failed to leave room: {}", e);
+                                        error!("leave_room({}) failed: {}", room, e);
                                     }
                                 }
                                 Some(XmppCommand::SendDirectMessage { to, body }) =>
                                 {
+                                    debug!("XmppCommand::SendDirectMessage to={} len={}", to, body.len());
                                     if let Err(e) = client.send_message(&to, &body).await
                                     {
-                                        error!("Failed to send direct message: {}", e);
+                                        error!("send_message({}) failed: {}", to, e);
                                     }
                                 }
                                 None => break,
