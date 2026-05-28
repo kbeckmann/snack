@@ -6,6 +6,15 @@ use crate::{ Message, Selection, Snack, MESSAGE_SCROLL_ID, MESSAGE_INPUT_ID };
 use crate::room::message::{ Message as RoomMessage, EventKind };
 use crate::ui::{ join, style };
 
+// Upper bound on how many of a room's most recent messages get turned into
+// widgets. iced's `scrollable` doesn't virtualise, so every rendered message is
+// laid out and text-shaped; switching rooms discards the per-widget shaped-text
+// cache and re-shapes the whole target room from scratch. Without a cap that
+// cost grows with the unbounded message history, so a long-running session
+// makes switching between busy rooms take seconds. All messages stay in memory;
+// only the rendered tail is bounded.
+const MAX_RENDERED_MESSAGES: usize = 500;
+
 // Split text into alternating (plain, url) fragments.
 fn parse_urls(body: &str) -> Vec<(&str, bool)>
 {
@@ -42,8 +51,16 @@ fn render_messages<'a>(
 {
     let today = chrono::Local::now().date_naive();
 
-    // Estimate nick column width from the longest nick in chat messages.
-    let max_nick_len = msgs.iter()
+    // Render only the most recent window; older messages stay in memory but are
+    // not turned into widgets (see MAX_RENDERED_MESSAGES). The read marker is an
+    // absolute index into `msgs`, so shift it into the window's coordinate space
+    // (clamping to the top when the marker scrolled off above the window).
+    let start = msgs.len().saturating_sub(MAX_RENDERED_MESSAGES);
+    let visible = &msgs[start..];
+    let rel_marker = read_marker.map(|m| m.saturating_sub(start));
+
+    // Estimate nick column width from the longest nick in rendered chat messages.
+    let max_nick_len = visible.iter()
         .filter_map(|m| match m
         {
             RoomMessage::Chat { from, .. } => Some(from.len()),
@@ -54,12 +71,12 @@ fn render_messages<'a>(
     // ~8px per character at size 14 + 2 chars for ": "
     let nick_width = ((max_nick_len + 2) as f32) * 8.0;
 
-    let mut messages: Vec<Element<'a, Message>> = Vec::with_capacity(msgs.len() + 1);
+    let mut messages: Vec<Element<'a, Message>> = Vec::with_capacity(visible.len() + 1);
 
-    for (i, m) in msgs.iter().enumerate()
+    for (i, m) in visible.iter().enumerate()
     {
         // Insert a "new messages" divider before the first new message.
-        if read_marker == Some(i) && i < msgs.len()
+        if rel_marker == Some(i)
         {
             let accent = Color::from_rgb(0.60, 0.40, 0.40);
             let new_label = text("  new messages  ").size(11).color(accent);
