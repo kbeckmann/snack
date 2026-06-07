@@ -19,6 +19,12 @@ impl Snack
                     return Message::TabPressed;
                 }
 
+                // Escape closes the find bar (a no-op when it isn't open).
+                if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::Escape)
+                {
+                    return Message::CloseFind;
+                }
+
                 if modifiers.alt() && !modifiers.shift() && !modifiers.control() && !modifiers.command()
                 {
                     if key == iced::keyboard::Key::Named(iced::keyboard::key::Named::ArrowUp)
@@ -42,6 +48,10 @@ impl Snack
                     {
                         return Message::LeaveSelection;
                     }
+                    if key == iced::keyboard::Key::Character("f".into())
+                    {
+                        return Message::ToggleFind;
+                    }
                 }
             }
 
@@ -58,6 +68,10 @@ impl Snack
             }
         });
 
+        // We disable exit-on-close so we can flush in-progress drafts to disk
+        // before the window actually closes.
+        let window_close = iced::window::close_requests().map(Message::WindowCloseRequested);
+
         match (&self.state, &self.xmpp_cmd_rx)
         {
             (AppState::Connecting | AppState::Connected, Some(cmd_rx)) =>
@@ -70,9 +84,9 @@ impl Snack
                     },
                 ).map(Message::XmppEvent);
 
-                return iced::Subscription::batch([keyboard, window_focus, xmpp_sub]);
+                return iced::Subscription::batch([keyboard, window_focus, window_close, xmpp_sub]);
             }
-            _ => return iced::Subscription::batch([keyboard, window_focus]),
+            _ => return iced::Subscription::batch([keyboard, window_focus, window_close]),
         }
     }
 }

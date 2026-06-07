@@ -62,6 +62,9 @@ pub enum XmppEvent
         nick: String,
         body: String,
         timestamp: chrono::DateTime<chrono::Utc>,
+        // True when the stanza carried an XEP-0203 `<delay>`, i.e. it is replayed
+        // history (MUC join backlog) rather than a live message. Drives dedup.
+        delayed: bool,
     },
     RoomSubject
     {
@@ -79,6 +82,7 @@ pub enum XmppEvent
         from: String,
         body: String,
         timestamp: chrono::DateTime<chrono::Utc>,
+        delayed: bool,
     },
 }
 
@@ -191,11 +195,12 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                                         }
                                         ::xmpp::XmppEvent::RoomMessage { room, nick, body, timestamp } =>
                                         {
+                                            let delayed = timestamp.is_some();
                                             let ts = timestamp
                                                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                                                 .map(|dt| dt.with_timezone(&chrono::Utc))
                                                 .unwrap_or_else(chrono::Utc::now);
-                                            Some(XmppEvent::RoomMessage { room, nick, body, timestamp: ts })
+                                            Some(XmppEvent::RoomMessage { room, nick, body, timestamp: ts, delayed })
                                         }
                                         ::xmpp::XmppEvent::RoomSubject { room, subject } =>
                                         {
@@ -207,11 +212,12 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                                         }
                                         ::xmpp::XmppEvent::DirectMessage { from, body, timestamp } =>
                                         {
+                                            let delayed = timestamp.is_some();
                                             let ts = timestamp
                                                 .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                                                 .map(|dt| dt.with_timezone(&chrono::Utc))
                                                 .unwrap_or_else(chrono::Utc::now);
-                                            Some(XmppEvent::DirectMessage { from, body, timestamp: ts })
+                                            Some(XmppEvent::DirectMessage { from, body, timestamp: ts, delayed })
                                         }
                                         _ => None,
                                     };

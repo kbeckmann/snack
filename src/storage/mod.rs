@@ -1,3 +1,4 @@
+use std::collections::HashMap;
 use std::fs;
 use std::io;
 use std::path::PathBuf;
@@ -8,8 +9,11 @@ use keyring_core::Entry;
 use log::warn;
 use serde::{ Deserialize, Serialize };
 
+pub mod history;
+
 const KEYRING_SERVICE: &str = "snack";
 const CONFIG_FILE: &str = "config.toml";
+const HISTORY_FILE: &str = "history.sqlite";
 
 #[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct SavedConfig
@@ -18,6 +22,10 @@ pub struct SavedConfig
     pub jid: Option<String>,
     #[serde(default)]
     pub rooms: Vec<String>,
+    // Unsent message text, keyed by room/contact JID, so each conversation
+    // keeps its own in-progress draft across room switches and restarts.
+    #[serde(default)]
+    pub drafts: HashMap<String, String>,
 }
 
 pub fn init_keyring()
@@ -69,6 +77,28 @@ fn config_path() -> Option<PathBuf>
 {
     return ProjectDirs::from("org", "snack", "snack")
         .map(|d| d.config_dir().join(CONFIG_FILE));
+}
+
+// The persistent chat-log database lives alongside other app data.
+pub fn history_path() -> Option<PathBuf>
+{
+    return ProjectDirs::from("org", "snack", "snack")
+        .map(|d| d.data_dir().join(HISTORY_FILE));
+}
+
+// Open (creating if needed) the persistent chat-log store.
+pub fn open_history() -> Option<history::History>
+{
+    let path = history_path()?;
+    return match history::History::open(&path)
+    {
+        Ok(h) => Some(h),
+        Err(e) =>
+        {
+            warn!("Failed to open chat history DB at {}: {}", path.display(), e);
+            None
+        }
+    };
 }
 
 pub fn load() -> SavedConfig

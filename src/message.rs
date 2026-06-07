@@ -37,4 +37,15 @@ pub enum Message
     ForgetAutoLogin,
     WindowFocused,
     WindowUnfocused,
+    WindowCloseRequested(iced::window::Id),
+    // Message-list scroll position changed; drives infinite-scroll paging and
+    // live-tail re-bounding.
+    MessagesScrolled(iced::widget::scrollable::Viewport),
+    // Find bar.
+    ToggleFind,
+    CloseFind,
+    FindInputChanged(String),
+    FindScopeToggled(bool),
+    FindNext,
+    FindPrev,
 }
