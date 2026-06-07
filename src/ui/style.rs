@@ -12,6 +12,30 @@ pub fn mention_highlight(_theme: &Theme) -> container::Style
     };
 }
 
+// A message that matches the current find query.
+pub fn find_match_highlight(_theme: &Theme) -> container::Style
+{
+    return container::Style
+    {
+        background: Some(iced::Background::Color(
+            Color::from_rgba(0.95, 0.80, 0.30, 0.18)
+        )),
+        ..Default::default()
+    };
+}
+
+// The single find hit currently focused (Enter/Shift+Enter target).
+pub fn find_current_highlight(_theme: &Theme) -> container::Style
+{
+    return container::Style
+    {
+        background: Some(iced::Background::Color(
+            Color::from_rgba(0.95, 0.65, 0.20, 0.42)
+        )),
+        ..Default::default()
+    };
+}
+
 pub fn room_button_active(theme: &Theme, status: button::Status) -> button::Style
 {
     let palette = theme.extended_palette();

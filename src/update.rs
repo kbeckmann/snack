@@ -3,11 +3,13 @@ use iced::widget::{ text_editor, Id };
 use log::{ error, warn };
 
 use crate::app::{
-    focus_input, focus_jid_input, focus_join_input, snap_to_bottom,
+    focus_find_input, focus_input, focus_jid_input, focus_join_input, snap_to_bottom,
     AppState, NickCompleteState, Selection, Snack,
-    ACCOUNT_PASSWORD_INPUT_ID, MESSAGE_INPUT_ID,
+    ACCOUNT_PASSWORD_INPUT_ID, MESSAGE_INPUT_ID, MESSAGE_SCROLL_ID,
 };
 use crate::message::Message;
+use crate::room::backlog::{ self, Backlog };
+use crate::storage::history::History;
 use crate::{ room, storage, xmpp };
 
 fn send_notification(summary: &str, body: &str)
@@ -60,8 +62,209 @@ fn delay_then(delay: std::time::Duration, msg: Message) -> Task<Message>
     return Task::perform(async move { let _ = rx.await; }, move |_| msg.clone());
 }
 
+// Load a conversation's persisted live tail into its in-memory window. When the
+// history DB is unavailable this just marks the window live (no persistence).
+fn seed_tail_for(history: &Option<History>, conv: &str, b: &mut dyn Backlog)
+{
+    if let Some(h) = history
+    {
+        let tail = h.load_tail(conv, backlog::LIVE_TAIL_CAP);
+        let has_older = tail.first().is_some_and(|m| h.has_older(conv, m.id));
+        b.seed_tail(tail, has_older);
+    }
+    else
+    {
+        b.set_at_live_tail(true);
+        b.set_anchored_bottom(true);
+    }
+}
+
 impl Snack
 {
+    // Persist a chat message, deduplicating. Returns its history row id, None for
+    // a dropped duplicate, or a sentinel when running without a DB.
+    fn persist_message(
+        &self,
+        conversation: &str,
+        sender: &str,
+        body: &str,
+        received: chrono::DateTime<chrono::Utc>,
+        delayed: bool,
+    ) -> Option<i64>
+    {
+        return match &self.history
+        {
+            Some(h) => h.insert(conversation, sender, body, received, delayed),
+            None => Some(-1),
+        };
+    }
+
+    fn active_conv_jid(&self) -> Option<String>
+    {
+        return match self.active
+        {
+            Some(Selection::Room(i)) => self.rooms.get(i).map(|r| r.jid.clone()),
+            Some(Selection::Chat(i)) => self.chats.get(i).map(|c| c.jid.clone()),
+            None => None,
+        };
+    }
+
+    fn active_backlog(&self) -> Option<&dyn Backlog>
+    {
+        return match self.active
+        {
+            Some(Selection::Room(i)) => self.rooms.get(i).map(|r| r as &dyn Backlog),
+            Some(Selection::Chat(i)) => self.chats.get(i).map(|c| c as &dyn Backlog),
+            None => None,
+        };
+    }
+
+    fn active_backlog_mut(&mut self) -> Option<&mut dyn Backlog>
+    {
+        return match self.active
+        {
+            Some(Selection::Room(i)) => self.rooms.get_mut(i).map(|r| r as &mut dyn Backlog),
+            Some(Selection::Chat(i)) => self.chats.get_mut(i).map(|c| c as &mut dyn Backlog),
+            None => None,
+        };
+    }
+
+    // Page the next older chunk of the active conversation in at the front.
+    // Returns whether anything was loaded.
+    fn page_older_active(&mut self) -> bool
+    {
+        let Some(jid) = self.active_conv_jid() else { return false; };
+        let Some(b) = self.active_backlog() else { return false; };
+
+        if !b.has_older() || b.messages().len() >= backlog::MAX_LOADED
+        {
+            return false;
+        }
+        let Some(before_id) = b.oldest_loaded_id() else { return false; };
+        let Some(h) = &self.history else { return false; };
+
+        let older = h.load_older(&jid, before_id, backlog::PAGE_SIZE);
+        if older.is_empty()
+        {
+            if let Some(b) = self.active_backlog_mut() { b.set_has_older(false); }
+            return false;
+        }
+        let new_has_older = older.first().is_some_and(|m| h.has_older(&jid, m.id));
+
+        if let Some(b) = self.active_backlog_mut()
+        {
+            b.prepend_older(older, new_has_older);
+        }
+        return true;
+    }
+
+    // Re-run the find search against the DB for the current query and scope,
+    // ordering hits oldest-first and focusing the most recent one.
+    fn run_find_search(&mut self)
+    {
+        let Some(find) = self.find.as_ref() else { return; };
+        let query = find.query.clone();
+        let all_scope = find.all_scope;
+
+        let mut matches = Vec::new();
+        if !query.trim().is_empty()
+        {
+            if let Some(h) = &self.history
+            {
+                if all_scope
+                {
+                    // Global, but only over conversations the user has open, so
+                    // every hit can actually be navigated to.
+                    let open: std::collections::HashSet<String> = self.rooms.iter()
+                        .map(|r| r.jid.clone())
+                        .chain(self.chats.iter().map(|c| c.jid.clone()))
+                        .collect();
+                    for hit in h.search(None, &query, 2000)
+                    {
+                        if open.contains(&hit.conversation)
+                        {
+                            matches.push(crate::app::FindMatch { conversation: hit.conversation, id: hit.id });
+                        }
+                    }
+                }
+                else if let Some(conv) = self.active_conv_jid()
+                {
+                    for hit in h.search(Some(&conv), &query, 2000)
+                    {
+                        matches.push(crate::app::FindMatch { conversation: hit.conversation, id: hit.id });
+                    }
+                }
+            }
+        }
+
+        if let Some(find) = self.find.as_mut()
+        {
+            // Focus the most recent (last) hit by default.
+            find.index = matches.len().saturating_sub(1);
+            find.matches = matches;
+        }
+    }
+
+    // Bring the currently-focused find match on screen: switch to its
+    // conversation if needed, load a window centred on it, and scroll to it.
+    fn jump_to_current_match(&mut self) -> Task<Message>
+    {
+        let Some(find) = self.find.as_ref() else { return Task::none(); };
+        let Some(m) = find.matches.get(find.index).cloned() else { return Task::none(); };
+
+        // Switch conversation if the hit is elsewhere (global scope).
+        if self.active_conv_jid().as_deref() != Some(m.conversation.as_str())
+        {
+            if let Some(i) = self.rooms.iter().position(|r| r.jid == m.conversation)
+            {
+                self.active = Some(Selection::Room(i));
+            }
+            else if let Some(i) = self.chats.iter().position(|c| c.jid == m.conversation)
+            {
+                self.active = Some(Selection::Chat(i));
+            }
+            else
+            {
+                return Task::none();
+            }
+        }
+
+        // Load a window centred on the hit (detached from the live tail).
+        let conv = m.conversation.clone();
+        let ctx = backlog::JUMP_CONTEXT;
+        if let Some(h) = &self.history
+        {
+            let window = h.load_window_around(&conv, m.id, ctx, ctx);
+            let has_older = window.first().is_some_and(|w| h.has_older(&conv, w.id));
+            let at_tail = window.last().is_none_or(|w| !h.has_newer(&conv, w.id));
+            if let Some(b) = self.active_backlog_mut()
+            {
+                b.set_window(window, has_older, at_tail);
+            }
+        }
+
+        // Scroll the focused message roughly into view. We don't have per-child
+        // scroll targeting, so approximate by the hit's position in the window;
+        // the highlight makes the exact line easy to spot. The list is
+        // bottom-anchored, so relative y is inverted (0 = bottom, 1 = top): a hit
+        // at top-fraction `f` of the content snaps to y = 1 - f.
+        let rel = self.active_backlog()
+            .map(|b|
+            {
+                let len = b.messages().len().max(1) as f32;
+                let pos = b.messages().iter()
+                    .position(|msg| matches!(msg, room::message::Message::Chat { id, .. } if *id == m.id))
+                    .unwrap_or(0) as f32;
+                (1.0 - (pos / len)).clamp(0.0, 1.0)
+            })
+            .unwrap_or(0.0);
+
+        return iced::widget::operation::snap_to(
+            Id::new(MESSAGE_SCROLL_ID),
+            iced::widget::scrollable::RelativeOffset { x: 0.0, y: rel },
+        );
+    }
+
     // When switching away from the currently active room/chat to `next`, stamp
     // the read marker on the one we're leaving so messages arriving while away
     // are flagged as new. No-op when staying on the same selection.
@@ -84,6 +287,70 @@ impl Snack
                 }
             }
             _ => {}
+        }
+    }
+
+    // JID identifying a sidebar selection; used as the key into the draft stash.
+    fn selection_jid(&self, sel: Selection) -> Option<String>
+    {
+        return match sel
+        {
+            Selection::Room(i) => self.rooms.get(i).map(|r| r.jid.clone()),
+            Selection::Chat(i) => self.chats.get(i).map(|c| c.jid.clone()),
+        };
+    }
+
+    // Move the active conversation's in-progress text into the draft stash, or
+    // clear its entry when blank. Call before changing `self.active` so each
+    // room/DM keeps its own unsent text when the user switches away.
+    fn stash_active_draft(&mut self)
+    {
+        let Some(jid) = self.active.and_then(|s| self.selection_jid(s)) else
+        {
+            return;
+        };
+
+        let text = self.message_input.text();
+        if text.trim().is_empty()
+        {
+            self.saved_config.drafts.remove(&jid);
+        }
+        else
+        {
+            self.saved_config.drafts.insert(jid, text);
+        }
+    }
+
+    // Load the draft stashed for `sel` into the editor (cursor at the end), or
+    // empty the editor when none is stashed.
+    fn load_draft(&mut self, sel: Selection)
+    {
+        let draft = self.selection_jid(sel)
+            .and_then(|jid| self.saved_config.drafts.get(&jid).cloned())
+            .unwrap_or_default();
+
+        self.message_input = text_editor::Content::with_text(&draft);
+        self.message_input.perform(text_editor::Action::Move(
+            iced::widget::text_editor::Motion::DocumentEnd,
+        ));
+    }
+
+    // Drop the active conversation's stashed draft (e.g. after sending or
+    // closing it). Returns whether an entry was actually removed.
+    fn clear_active_draft(&mut self) -> bool
+    {
+        let Some(jid) = self.active.and_then(|s| self.selection_jid(s)) else
+        {
+            return false;
+        };
+        return self.saved_config.drafts.remove(&jid).is_some();
+    }
+
+    fn persist_drafts(&self)
+    {
+        if let Err(e) = storage::save(&self.saved_config)
+        {
+            log::warn!("Failed to persist drafts: {}", e);
         }
     }
 
@@ -546,6 +813,10 @@ impl Snack
                         self.joining_room = None;
                         self.join_error = None;
 
+                        // Switching focus to the joined room: stash the draft for
+                        // whatever was active so it isn't clobbered below.
+                        self.stash_active_draft();
+
                         // Persist room if user opted in and it's not already saved.
                         if self.save_room && !self.saved_config.rooms.iter().any(|r| r == &jid)
                         {
@@ -587,9 +858,28 @@ impl Snack
                                 messages: Vec::new(),
                                 unread: false,
                                 read_marker: None,
+                                oldest_loaded_id: None,
+                                has_older: false,
+                                at_live_tail: true,
+                                anchored_bottom: true,
                             });
 
-                            self.active = Some(Selection::Room(self.rooms.len() - 1));
+                            let i = self.rooms.len() - 1;
+                            self.active = Some(Selection::Room(i));
+
+                            // Seed the freshly-opened room with its persisted tail
+                            // so last session's history is visible immediately
+                            // (before any server replay, which then dedupes
+                            // against the DB).
+                            let conv = self.rooms[i].jid.clone();
+                            seed_tail_for(&self.history, &conv, &mut self.rooms[i]);
+                        }
+
+                        // Restore this room's stashed draft (loaded from disk on
+                        // launch, so auto-joined rooms come back with their text).
+                        if let Some(sel) = self.active
+                        {
+                            self.load_draft(sel);
                         }
 
                         self.show_join_panel = false;
@@ -634,11 +924,13 @@ impl Snack
                         if let Some(pos) = self.rooms.iter().position(|r| r.jid == jid)
                         {
                             self.rooms.remove(pos);
+                            self.saved_config.drafts.remove(&jid);
                             if let Some(Selection::Room(active)) = self.active
                             {
                                 if active == pos
                                 {
                                     self.active = None;
+                                    self.message_input = text_editor::Content::new();
                                 }
                                 else if active > pos
                                 {
@@ -702,68 +994,92 @@ impl Snack
                             });
                         }
                     }
-                    xmpp::XmppEvent::RoomMessage { room, nick, body, timestamp } =>
+                    xmpp::XmppEvent::RoomMessage { room, nick, body, timestamp, delayed } =>
                     {
-                        let room_idx = self.rooms.iter().position(|r| r.jid == room);
-                        if let Some(idx) = room_idx
+                        let Some(idx) = self.rooms.iter().position(|r| r.jid == room) else
                         {
-                            let msg_index = self.rooms[idx].messages.len();
-                            self.rooms[idx].messages.push(room::message::Message::Chat
+                            return Task::none();
+                        };
+
+                        // Persist + dedup first. A None result means this was a
+                        // duplicate (e.g. MUC history replayed on rejoin) and is
+                        // dropped without ever reaching the UI.
+                        let conv = self.rooms[idx].jid.clone();
+                        let Some(db_id) = self.persist_message(&conv, &nick, &body, timestamp, delayed) else
+                        {
+                            return Task::none();
+                        };
+
+                        let is_active = self.active == Some(Selection::Room(idx));
+                        let own_nick = self.connected_jid
+                            .as_deref()
+                            .and_then(|j| j.split('@').next())
+                            .unwrap_or("")
+                            .to_string();
+                        let user_is_watching = is_active && self.window_focused;
+                        let is_own = nick == own_nick;
+
+                        // Only extend the in-memory window when it is showing the
+                        // live tail AND the user is parked at the bottom. If they
+                        // have scrolled/jumped into history, the message is safely
+                        // in the DB and reappears when they return to the bottom —
+                        // so it never yanks their view.
+                        if self.rooms[idx].at_live_tail && self.rooms[idx].anchored_bottom
+                        {
+                            self.rooms[idx].append_live(room::message::Message::Chat
                             {
+                                id: db_id,
                                 from: nick.clone(),
-                                body,
+                                body: body.clone(),
                                 received: timestamp,
                             });
 
-                            let is_active = self.active == Some(Selection::Room(idx));
-                            let user_is_watching = is_active && self.window_focused;
-
-                            let own_nick = self.connected_jid
-                                .as_deref()
-                                .and_then(|j| j.split('@').next())
-                                .unwrap_or("");
-                            let is_own = nick == own_nick;
+                            // New-message index after any trim performed by append_live.
+                            let new_index = self.rooms[idx].messages.len() - 1;
 
                             if !user_is_watching && !is_own
                             {
                                 self.rooms[idx].unread = true;
                                 if self.rooms[idx].read_marker.is_none()
                                 {
-                                    self.rooms[idx].read_marker = Some(msg_index);
+                                    self.rooms[idx].read_marker = Some(new_index);
                                 }
                             }
                             else if is_own && is_active
                             {
-                                // Own echo in active room: advance marker past our message so it
-                                // never appears in the "new messages" section.
+                                // Own echo in active room: advance marker past our
+                                // message so it never shows under "new messages".
                                 if let Some(marker) = self.rooms[idx].read_marker
                                 {
-                                    if marker <= msg_index
+                                    if marker <= new_index
                                     {
-                                        self.rooms[idx].read_marker = Some(msg_index + 1);
+                                        self.rooms[idx].read_marker = Some(new_index + 1);
                                     }
                                 }
                             }
+                        }
+                        else if !is_active
+                        {
+                            self.rooms[idx].unread = true;
+                        }
 
-                            if !self.window_focused && !is_own
-                            {
-                                if let Some(room::message::Message::Chat { body, .. }) =
-                                    self.rooms[idx].messages.last()
-                                {
-                                    if room::message::mentions(body, own_nick)
-                                    {
-                                        let room_name =
-                                            room.split('@').next().unwrap_or(&room);
-                                        send_notification(
-                                            &format!("{} in {}", nick, room_name),
-                                            body,
-                                        );
-                                    }
-                                }
-                            }
+                        // Notify on a mention while the window isn't being watched.
+                        // Check the event body directly so it works even when the
+                        // message wasn't appended (user scrolled into history).
+                        if !self.window_focused && !is_own
+                            && room::message::mentions(&body, &own_nick)
+                        {
+                            let room_name = room.split('@').next().unwrap_or(&room);
+                            send_notification(&format!("{} in {}", nick, room_name), &body);
+                        }
 
+                        // Keep the live tail pinned to the bottom for the active
+                        // room; never yank a user who has scrolled into history.
+                        if is_active && self.rooms[idx].at_live_tail && self.rooms[idx].anchored_bottom
+                        {
                             return snap_to_bottom();
                         }
+                        return Task::none();
                     }
                     xmpp::XmppEvent::RoomSubject { room, subject } =>
                     {
@@ -772,7 +1088,7 @@ impl Snack
                             r.topic = subject;
                         }
                     }
-                    xmpp::XmppEvent::DirectMessage { from, body, timestamp } =>
+                    xmpp::XmppEvent::DirectMessage { from, body, timestamp, delayed } =>
                     {
                         let bare = from.split('/').next().unwrap_or(&from).to_string();
                         let idx = match self.chats.iter().position(|c| c.jid == bare)
@@ -781,6 +1097,7 @@ impl Snack
                             None =>
                             {
                                 let title = bare.split('@').next().unwrap_or(&bare).to_string();
+                                let conv = bare.clone();
                                 self.chats.push(room::chat::Chat
                                 {
                                     jid: bare,
@@ -788,47 +1105,75 @@ impl Snack
                                     messages: Vec::new(),
                                     unread: false,
                                     read_marker: None,
+                                    oldest_loaded_id: None,
+                                    has_older: false,
+                                    at_live_tail: true,
+                                    anchored_bottom: true,
                                 });
-                                self.chats.len() - 1
+                                let i = self.chats.len() - 1;
+                                seed_tail_for(&self.history, &conv, &mut self.chats[i]);
+                                i
                             }
                         };
 
+                        let conv = self.chats[idx].jid.clone();
                         let nick = self.chats[idx].title.clone();
-                        let msg_index = self.chats[idx].messages.len();
-                        self.chats[idx].messages.push(room::message::Message::Chat
+                        let Some(db_id) = self.persist_message(&conv, &nick, &body, timestamp, delayed) else
                         {
-                            from: nick,
-                            body,
-                            received: timestamp,
-                        });
+                            return Task::none();
+                        };
 
-                        let is_active_chat = self.active == Some(Selection::Chat(idx));
-                        let user_is_watching = is_active_chat && self.window_focused;
+                        let is_active = self.active == Some(Selection::Chat(idx));
+                        let user_is_watching = is_active && self.window_focused;
 
-                        if !user_is_watching
+                        if self.chats[idx].at_live_tail && self.chats[idx].anchored_bottom
+                        {
+                            self.chats[idx].append_live(room::message::Message::Chat
+                            {
+                                id: db_id,
+                                from: nick,
+                                body: body.clone(),
+                                received: timestamp,
+                            });
+
+                            if !user_is_watching
+                            {
+                                let new_index = self.chats[idx].messages.len() - 1;
+                                self.chats[idx].unread = true;
+                                if self.chats[idx].read_marker.is_none()
+                                {
+                                    self.chats[idx].read_marker = Some(new_index);
+                                }
+                            }
+                        }
+                        else if !user_is_watching
                         {
                             self.chats[idx].unread = true;
-                            if self.chats[idx].read_marker.is_none()
-                            {
-                                self.chats[idx].read_marker = Some(msg_index);
-                            }
                         }
 
+                        // A 1:1 message always warrants a notification when the
+                        // window isn't being watched. Use the event body directly
+                        // so it works even if the message wasn't appended (user
+                        // scrolled into history).
                         if !self.window_focused
                         {
-                            if let Some(room::message::Message::Chat { from, body, .. }) =
-                                self.chats[idx].messages.last()
-                            {
-                                send_notification(from, body);
-                            }
+                            send_notification(&self.chats[idx].title, &body);
                         }
 
-                        return snap_to_bottom();
+                        if is_active && self.chats[idx].at_live_tail && self.chats[idx].anchored_bottom
+                        {
+                            return snap_to_bottom();
+                        }
+                        return Task::none();
                     }
                 }
             }
             Message::Disconnect =>
             {
+                // Preserve the active conversation's draft across logout.
+                self.stash_active_draft();
+                self.persist_drafts();
+
                 self.state = AppState::Login;
                 self.connected_jid = None;
                 self.rooms.clear();
@@ -865,26 +1210,65 @@ impl Snack
             }
             Message::SelectRoom(index) =>
             {
-                self.stamp_active_read_marker(Some(Selection::Room(index)));
+                let next = Selection::Room(index);
+                let changed = self.active != Some(next);
+                if changed
+                {
+                    self.stash_active_draft();
+                }
 
-                self.active = Some(Selection::Room(index));
+                self.stamp_active_read_marker(Some(next));
+
+                self.active = Some(next);
                 self.show_join_panel = false;
+                self.find = None;
                 if let Some(r) = self.rooms.get_mut(index)
                 {
                     r.unread = false;
+                }
+                // Re-attach to the live tail and re-bound the window on switch.
+                if changed
+                {
+                    let conv = self.rooms[index].jid.clone();
+                    seed_tail_for(&self.history, &conv, &mut self.rooms[index]);
+                }
+
+                if changed
+                {
+                    self.load_draft(next);
+                    self.persist_drafts();
                 }
 
                 return Task::batch([snap_to_bottom(), focus_input()]);
             }
             Message::SelectChat(index) =>
             {
-                self.stamp_active_read_marker(Some(Selection::Chat(index)));
+                let next = Selection::Chat(index);
+                let changed = self.active != Some(next);
+                if changed
+                {
+                    self.stash_active_draft();
+                }
 
-                self.active = Some(Selection::Chat(index));
+                self.stamp_active_read_marker(Some(next));
+
+                self.active = Some(next);
                 self.show_join_panel = false;
+                self.find = None;
                 if let Some(c) = self.chats.get_mut(index)
                 {
                     c.unread = false;
+                }
+                if changed
+                {
+                    let conv = self.chats[index].jid.clone();
+                    seed_tail_for(&self.history, &conv, &mut self.chats[index]);
+                }
+
+                if changed
+                {
+                    self.load_draft(next);
+                    self.persist_drafts();
                 }
 
                 return Task::batch([snap_to_bottom(), focus_input()]);
@@ -898,6 +1282,7 @@ impl Snack
                     None =>
                     {
                         let title = bare.split('@').next().unwrap_or(&bare).to_string();
+                        let conv = bare.clone();
                         self.chats.push(room::chat::Chat
                         {
                             jid: bare,
@@ -905,8 +1290,14 @@ impl Snack
                             messages: Vec::new(),
                             unread: false,
                             read_marker: None,
+                            oldest_loaded_id: None,
+                            has_older: false,
+                            at_live_tail: true,
+                            anchored_bottom: true,
                         });
-                        self.chats.len() - 1
+                        let i = self.chats.len() - 1;
+                        seed_tail_for(&self.history, &conv, &mut self.chats[i]);
+                        i
                     }
                 };
 
@@ -958,8 +1349,21 @@ impl Snack
                             }
                         }
 
+                        // Reattach to the live tail (the server will echo our
+                        // message back, which then appends to the window).
+                        if !self.rooms[index].at_live_tail
+                        {
+                            let conv = self.rooms[index].jid.clone();
+                            seed_tail_for(&self.history, &conv, &mut self.rooms[index]);
+                        }
+                        self.rooms[index].set_anchored_bottom(true);
+
                         self.message_input = text_editor::Content::new();
                         self.nick_complete = None;
+                        if self.clear_active_draft()
+                        {
+                            self.persist_drafts();
+                        }
 
                         return Task::batch([snap_to_bottom(), focus_input()]);
                     }
@@ -986,25 +1390,44 @@ impl Snack
                             .unwrap_or("me")
                             .to_string();
 
-                        let msg_index = self.chats[index].messages.len();
+                        let conv = self.chats[index].jid.clone();
+                        let received = chrono::Utc::now();
+                        let db_id = self.persist_message(&conv, &own_nick, &body, received, false)
+                            .unwrap_or(-1);
 
-                        self.chats[index].messages.push(room::message::Message::Chat
+                        if self.chats[index].at_live_tail
                         {
-                            from: own_nick,
-                            body,
-                            received: chrono::Utc::now(),
-                        });
-
-                        if let Some(marker) = self.chats[index].read_marker
-                        {
-                            if marker <= msg_index
+                            self.chats[index].append_live(room::message::Message::Chat
                             {
-                                self.chats[index].read_marker = Some(msg_index + 1);
+                                id: db_id,
+                                from: own_nick,
+                                body,
+                                received,
+                            });
+
+                            let new_index = self.chats[index].messages.len() - 1;
+                            if let Some(marker) = self.chats[index].read_marker
+                            {
+                                if marker <= new_index
+                                {
+                                    self.chats[index].read_marker = Some(new_index + 1);
+                                }
                             }
                         }
+                        else
+                        {
+                            // Sending while browsing history: snap back to the live
+                            // tail so the just-sent message is visible.
+                            seed_tail_for(&self.history, &conv, &mut self.chats[index]);
+                        }
+                        self.chats[index].set_anchored_bottom(true);
 
                         self.message_input = text_editor::Content::new();
                         self.nick_complete = None;
+                        if self.clear_active_draft()
+                        {
+                            self.persist_drafts();
+                        }
 
                         return Task::batch([snap_to_bottom(), focus_input()]);
                     }
@@ -1040,12 +1463,11 @@ impl Snack
                     // If already in this room, just switch to it.
                     if let Some(pos) = self.rooms.iter().position(|r| r.jid == jid)
                     {
-                        self.active = Some(Selection::Room(pos));
                         self.show_join_panel = false;
                         self.join_input.clear();
                         self.join_error = None;
 
-                        return Task::batch([snap_to_bottom(), focus_input()]);
+                        return Task::done(Message::SelectRoom(pos));
                     }
 
                     if let Some(ref tx) = self.xmpp_cmd_tx
@@ -1084,6 +1506,9 @@ impl Snack
                         });
                     }
 
+                    // Drop any stashed draft for the room we're leaving.
+                    self.saved_config.drafts.remove(&room_jid);
+
                     // Stop auto-joining this room next time.
                     let before = self.saved_config.rooms.len();
                     self.saved_config.rooms.retain(|r| r != &room_jid);
@@ -1104,13 +1529,17 @@ impl Snack
                     // already gone.
                     self.rooms.remove(index);
                     self.active = None;
+                    self.message_input = text_editor::Content::new();
                 }
             }
             Message::CloseChat =>
             {
                 if let Some(Selection::Chat(index)) = self.active
                 {
+                    let chat_jid = self.chats[index].jid.clone();
                     self.chats.remove(index);
+                    self.saved_config.drafts.remove(&chat_jid);
+
                     if self.chats.is_empty()
                     {
                         self.active = self.rooms.first().map(|_| Selection::Room(0));
@@ -1119,6 +1548,13 @@ impl Snack
                     {
                         self.active = Some(Selection::Chat(index.saturating_sub(1)));
                     }
+
+                    match self.active
+                    {
+                        Some(sel) => self.load_draft(sel),
+                        None => self.message_input = text_editor::Content::new(),
+                    }
+                    self.persist_drafts();
                 }
             }
             Message::LeaveSelection =>
@@ -1195,6 +1631,132 @@ impl Snack
                         }
                     }
                     None => {}
+                }
+            }
+            Message::WindowCloseRequested(id) =>
+            {
+                // Flush the active conversation's in-progress draft (the others
+                // are already stashed) so nothing is lost on the next launch.
+                self.stash_active_draft();
+                self.persist_drafts();
+                return iced::window::close(id);
+            }
+            Message::MessagesScrolled(viewport) =>
+            {
+                let rel = viewport.relative_offset();
+                // Bottom-anchored list: y ~ 0 is the bottom (newest), y ~ 1 is the
+                // top (oldest).
+                let at_bottom = rel.y <= 0.02;
+                let near_top = rel.y >= 0.92;
+
+                let was_bottom = self.active_backlog()
+                    .map(|b| b.anchored_bottom())
+                    .unwrap_or(true);
+                if let Some(b) = self.active_backlog_mut()
+                {
+                    b.set_anchored_bottom(at_bottom);
+                }
+
+                if at_bottom && !was_bottom
+                {
+                    // Back at the live tail: reattach, re-bound the window, and
+                    // reveal anything that arrived while we were scrolled up.
+                    if let Some(jid) = self.active_conv_jid()
+                    {
+                        match self.active
+                        {
+                            Some(Selection::Room(i)) => seed_tail_for(&self.history, &jid, &mut self.rooms[i]),
+                            Some(Selection::Chat(i)) => seed_tail_for(&self.history, &jid, &mut self.chats[i]),
+                            None => {}
+                        }
+                        return snap_to_bottom();
+                    }
+                }
+                else if near_top
+                {
+                    // Page older history in at the front; the bottom anchor keeps
+                    // the user's current content visually fixed across the prepend.
+                    self.page_older_active();
+                }
+            }
+            Message::ToggleFind =>
+            {
+                if self.active.is_none()
+                {
+                    return Task::none();
+                }
+                if self.find.is_some()
+                {
+                    self.find = None;
+                    return focus_input();
+                }
+                self.find = Some(crate::app::FindState::default());
+                return focus_find_input();
+            }
+            Message::CloseFind =>
+            {
+                if self.find.take().is_some()
+                {
+                    return focus_input();
+                }
+            }
+            Message::FindInputChanged(value) =>
+            {
+                if let Some(find) = self.find.as_mut()
+                {
+                    find.query = value;
+                }
+                self.run_find_search();
+                let has = self.find.as_ref().is_some_and(|f| !f.matches.is_empty());
+                if has
+                {
+                    return self.jump_to_current_match();
+                }
+            }
+            Message::FindScopeToggled(all) =>
+            {
+                if let Some(find) = self.find.as_mut()
+                {
+                    find.all_scope = all;
+                }
+                self.run_find_search();
+                let has = self.find.as_ref().is_some_and(|f| !f.matches.is_empty());
+                if has
+                {
+                    return self.jump_to_current_match();
+                }
+                return focus_find_input();
+            }
+            Message::FindNext =>
+            {
+                let jump = match self.find.as_mut()
+                {
+                    Some(find) if !find.matches.is_empty() =>
+                    {
+                        find.index = (find.index + 1) % find.matches.len();
+                        true
+                    }
+                    _ => false,
+                };
+                if jump
+                {
+                    return self.jump_to_current_match();
+                }
+            }
+            Message::FindPrev =>
+            {
+                let jump = match self.find.as_mut()
+                {
+                    Some(find) if !find.matches.is_empty() =>
+                    {
+                        find.index = if find.index == 0 { find.matches.len() - 1 } else { find.index - 1 };
+                        true
+                    }
+                    _ => false,
+                };
+                if jump
+                {
+                    return self.jump_to_current_match();
                 }
             }
         }

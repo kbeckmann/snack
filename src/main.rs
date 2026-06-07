@@ -13,8 +13,8 @@ mod view;
 mod xmpp;
 
 pub use app::{
-    AppState, NickCompleteState, Selection, Snack,
-    ACCOUNT_JID_INPUT_ID, ACCOUNT_PASSWORD_INPUT_ID, JOIN_INPUT_ID,
+    AppState, FindMatch, FindState, NickCompleteState, Selection, Snack,
+    ACCOUNT_JID_INPUT_ID, ACCOUNT_PASSWORD_INPUT_ID, FIND_INPUT_ID, JOIN_INPUT_ID,
     MESSAGE_INPUT_ID, MESSAGE_SCROLL_ID,
 };
 pub use message::Message;
@@ -50,5 +50,8 @@ fn application() -> Application<impl Program<Message = Message, Theme = Theme>>
     return iced::application(Snack::new, Snack::update, Snack::view)
                 .subscription(Snack::subscription)
                 .title(Snack::title)
-                .theme(Snack::theme);
+                .theme(Snack::theme)
+                // Handle window-close ourselves so drafts are flushed to disk
+                // before the app exits (see Message::WindowCloseRequested).
+                .exit_on_close_request(false);
 }

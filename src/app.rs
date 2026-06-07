@@ -9,6 +9,12 @@ pub const MESSAGE_INPUT_ID: &str = "message_input";
 pub const JOIN_INPUT_ID: &str = "join_input";
 pub const ACCOUNT_JID_INPUT_ID: &str = "account_jid_input";
 pub const ACCOUNT_PASSWORD_INPUT_ID: &str = "account_password_input";
+pub const FIND_INPUT_ID: &str = "find_input";
+
+pub(crate) fn focus_find_input() -> Task<Message>
+{
+    iced::widget::operation::focus(Id::new(FIND_INPUT_ID))
+}
 
 pub(crate) fn focus_jid_input() -> Task<Message>
 {
@@ -27,7 +33,13 @@ pub(crate) fn focus_input() -> Task<Message>
 
 pub(crate) fn snap_to_bottom() -> Task<Message>
 {
-    iced::widget::operation::snap_to_end(Id::new(MESSAGE_SCROLL_ID))
+    // The message list is bottom-anchored (see ui::chat), which inverts relative
+    // offsets: y = 0.0 renders as the bottom (newest). So snapping to the newest
+    // message targets the start offset, not the end.
+    iced::widget::operation::snap_to(
+        Id::new(MESSAGE_SCROLL_ID),
+        iced::widget::scrollable::RelativeOffset { x: 0.0, y: 0.0 },
+    )
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -54,6 +66,26 @@ pub struct NickCompleteState
     pub last_output: String,
 }
 
+// One search hit: which conversation it belongs to and its history DB row id.
+#[derive(Debug, Clone)]
+pub struct FindMatch
+{
+    pub conversation: String,
+    pub id: i64,
+}
+
+// State of the in-room find bar (present only while the bar is open).
+#[derive(Debug, Clone, Default)]
+pub struct FindState
+{
+    pub query: String,
+    // false = search only the active conversation, true = all open conversations.
+    pub all_scope: bool,
+    // Hits ordered oldest-first; `index` is the currently-focused one.
+    pub matches: Vec<FindMatch>,
+    pub index: usize,
+}
+
 pub struct Snack
 {
     pub(crate) state: AppState,
@@ -78,6 +110,11 @@ pub struct Snack
     pub(crate) auto_login_attempt: bool,
     pub(crate) nick_complete: Option<NickCompleteState>,
     pub(crate) window_focused: bool,
+    // Persistent, searchable chat-log store. None if the DB could not be opened,
+    // in which case the app degrades to its old in-memory-only behaviour.
+    pub(crate) history: Option<storage::history::History>,
+    // Find bar; Some only while open over the active conversation.
+    pub(crate) find: Option<FindState>,
     // Auto-reconnect: when an established session drops (e.g. after the laptop
     // wakes from sleep) we transparently retry with exponential backoff instead
     // of dumping the user back to the login screen. Credentials are stashed so
@@ -119,6 +156,8 @@ impl Snack
             auto_login_attempt: false,
             nick_complete: None,
             window_focused: true,
+            history: storage::open_history(),
+            find: None,
             reconnecting: false,
             reconnect_attempts: 0,
             reconnect_jid: None,
