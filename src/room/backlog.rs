@@ -16,6 +16,8 @@
 // All of this is index-backed in SQLite, so extracting any sub-window is O(log
 // n) regardless of how long the log is.
 
+use chrono::{ DateTime, Utc };
+
 use crate::room::message::Message;
 use crate::storage::history::StoredMessage;
 
@@ -53,6 +55,33 @@ pub trait Backlog
     fn set_at_live_tail(&mut self, v: bool);
     fn anchored_bottom(&self) -> bool;
     fn set_anchored_bottom(&mut self, v: bool);
+    // XEP-0313 MAM paging state: whether a server archive query is outstanding,
+    // whether the server archive is exhausted, and the RSM cursor for the next
+    // older page.
+    fn mam_in_flight(&self) -> bool;
+    fn set_mam_in_flight(&mut self, v: bool);
+    fn mam_exhausted(&self) -> bool;
+    fn set_mam_exhausted(&mut self, v: bool);
+    fn mam_cursor(&self) -> Option<String>;
+    fn set_mam_cursor(&mut self, v: Option<String>);
+
+    // Timestamp of the oldest loaded persisted message, used as the MAM `end`
+    // bound when first paging the server archive.
+    fn oldest_received(&self) -> Option<DateTime<Utc>>
+    {
+        return self.messages().iter().find_map(|m| match m
+        {
+            Message::Chat { received, .. } => Some(*received),
+            _ => None,
+        });
+    }
+
+    // Whether more history might exist either locally (DB) or on the server —
+    // drives the "earlier messages" affordance and scroll-up fetching.
+    fn more_history(&self) -> bool
+    {
+        return self.has_older() || !self.mam_exhausted();
+    }
 
     // Recompute the oldest loaded DB id by finding the front-most persisted
     // (Chat) message. Events carry no id and are skipped.

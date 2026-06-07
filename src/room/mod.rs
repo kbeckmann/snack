@@ -18,6 +18,9 @@ pub struct Room
     pub has_older: bool,
     pub at_live_tail: bool,
     pub anchored_bottom: bool,
+    pub mam_in_flight: bool,
+    pub mam_exhausted: bool,
+    pub mam_cursor: Option<String>,
 }
 
 impl backlog::Backlog for Room
@@ -33,4 +36,10 @@ impl backlog::Backlog for Room
     fn set_at_live_tail(&mut self, v: bool) { self.at_live_tail = v; }
     fn anchored_bottom(&self) -> bool { self.anchored_bottom }
     fn set_anchored_bottom(&mut self, v: bool) { self.anchored_bottom = v; }
+    fn mam_in_flight(&self) -> bool { self.mam_in_flight }
+    fn set_mam_in_flight(&mut self, v: bool) { self.mam_in_flight = v; }
+    fn mam_exhausted(&self) -> bool { self.mam_exhausted }
+    fn set_mam_exhausted(&mut self, v: bool) { self.mam_exhausted = v; }
+    fn mam_cursor(&self) -> Option<String> { self.mam_cursor.clone() }
+    fn set_mam_cursor(&mut self, v: Option<String>) { self.mam_cursor = v; }
 }

@@ -17,6 +17,21 @@ pub enum XmppCommand
     LeaveRoom { room: String, nick: String },
     SendRoomMessage { room: String, body: String },
     SendDirectMessage { to: String, body: String },
+    // Page the server-side archive (XEP-0313 MAM). `to` is the room JID for a
+    // MUC archive, `with` the contact JID for a 1:1 archive. `forward` walks
+    // towards the present from `start` (catch-up) or towards the past bounded by
+    // `end` (scroll-up); `cursor` is the RSM cursor for subsequent pages.
+    QueryArchive
+    {
+        query_id: String,
+        to: Option<String>,
+        with: Option<String>,
+        start: Option<String>,
+        end: Option<String>,
+        forward: bool,
+        cursor: Option<String>,
+        max: u32,
+    },
 }
 
 struct ChannelInner
@@ -90,6 +105,24 @@ pub enum XmppEvent
         body: String,
         timestamp: chrono::DateTime<chrono::Utc>,
         delayed: bool,
+    },
+    // A single message returned by a MAM archive query.
+    ArchiveMessage
+    {
+        query_id: String,
+        from: String,
+        body: String,
+        timestamp: chrono::DateTime<chrono::Utc>,
+    },
+    // A MAM archive query finished. `complete` means no further pages remain in
+    // the query's direction; `first`/`last` are the RSM cursors for paging
+    // further back (`first`) or continuing a forward catch-up (`last`).
+    ArchiveComplete
+    {
+        query_id: String,
+        complete: bool,
+        first: Option<String>,
+        last: Option<String>,
     },
 }
 
@@ -240,6 +273,18 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                                                 .unwrap_or_else(chrono::Utc::now);
                                             Some(XmppEvent::DirectMessage { from, body, timestamp: ts, delayed })
                                         }
+                                        ::xmpp::XmppEvent::ArchiveMessage { query_id, from, body, timestamp } =>
+                                        {
+                                            let ts = timestamp
+                                                .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
+                                                .map(|dt| dt.with_timezone(&chrono::Utc))
+                                                .unwrap_or_else(chrono::Utc::now);
+                                            Some(XmppEvent::ArchiveMessage { query_id, from, body, timestamp: ts })
+                                        }
+                                        ::xmpp::XmppEvent::ArchiveComplete { query_id, complete, first, last } =>
+                                        {
+                                            Some(XmppEvent::ArchiveComplete { query_id, complete, first, last })
+                                        }
                                         _ => None,
                                     };
 
@@ -306,6 +351,24 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                                     client.send_message(&to, &body).await.err().inspect(|e|
                                     {
                                         error!("send_message({}) failed: {}", to, e);
+                                    })
+                                }
+                                Some(XmppCommand::QueryArchive { query_id, to, with, start, end, forward, cursor, max }) =>
+                                {
+                                    debug!("XmppCommand::QueryArchive id={} to={:?} with={:?} fwd={} cursor={:?}", query_id, to, with, forward, cursor);
+                                    client.query_archive(::xmpp::ArchiveQuery
+                                    {
+                                        query_id: &query_id,
+                                        to: to.as_deref(),
+                                        with: with.as_deref(),
+                                        start: start.as_deref(),
+                                        end: end.as_deref(),
+                                        forward,
+                                        cursor: cursor.as_deref(),
+                                        max,
+                                    }).await.err().inspect(|e|
+                                    {
+                                        error!("query_archive({}) failed: {}", query_id, e);
                                     })
                                 }
                                 None => break,

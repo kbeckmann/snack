@@ -4,7 +4,10 @@ version = "0.1.9"
 edition = "2024"
 
 [dependencies]
-libxmpp = "0.2.1"
+# Vendored fork of libxmpp 0.2.1 (the version upstream tracks), patched to add
+# XEP-0313 (MAM) for server-side history paging — stock 0.2.1 exposes no way to
+# send a custom IQ or surface archive stanzas. See vendor/libxmpp.
+libxmpp = { path = "vendor/libxmpp" }
 iced = "0.14.0"
 tokio = { version = "1.52.3", features = ["full"] }
 chrono = "0.4.44"

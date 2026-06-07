@@ -6,6 +6,7 @@ use iced::widget::{ button, checkbox, column, container, rich_text, row, scrolla
 
 use crate::app::FindState;
 use crate::{ Message, Selection, Snack, FIND_INPUT_ID, MESSAGE_SCROLL_ID, MESSAGE_INPUT_ID };
+use crate::room::backlog::Backlog;
 use crate::room::message::{ Message as RoomMessage, EventKind };
 use crate::ui::{ join, style };
 
@@ -397,7 +398,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
             let highlight = find_highlight(state, &room.jid);
             let messages = render_messages(
                 &room.messages, room.read_marker, my_nick,
-                room.has_older, highlight.as_ref(),
+                room.more_history(), highlight.as_ref(),
             );
 
             let mut col = column![topic_label, messages].spacing(8);
@@ -436,7 +437,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
             let highlight = find_highlight(state, &chat.jid);
             let messages = render_messages(
                 &chat.messages, chat.read_marker, my_nick,
-                chat.has_older, highlight.as_ref(),
+                chat.more_history(), highlight.as_ref(),
             );
 
             let mut col = column![header, messages].spacing(8);

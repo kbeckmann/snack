@@ -115,6 +115,17 @@ pub struct Snack
     pub(crate) history: Option<storage::history::History>,
     // Find bar; Some only while open over the active conversation.
     pub(crate) find: Option<FindState>,
+    // MAM (server archive) paging: a monotonic counter for query ids and a map
+    // from in-flight query id to the conversation JID it is paging.
+    pub(crate) mam_seq: u64,
+    pub(crate) mam_pending: std::collections::HashMap<String, String>,
+    // Catch-up sync state for conversations with a sweep in progress: (pages
+    // fetched, new messages stored in the current page). The sweep walks the
+    // recent archive backwards from the present and stops once a page yields no
+    // new messages (i.e. it has reached history we already hold). `mam_caught_up`
+    // marks conversations swept this session so re-selecting doesn't re-sync.
+    pub(crate) mam_catchup: std::collections::HashMap<String, (u32, u32)>,
+    pub(crate) mam_caught_up: std::collections::HashSet<String>,
     // Auto-reconnect: when an established session drops (e.g. after the laptop
     // wakes from sleep) we transparently retry with exponential backoff instead
     // of dumping the user back to the login screen. Credentials are stashed so
@@ -158,6 +169,10 @@ impl Snack
             window_focused: true,
             history: storage::open_history(),
             find: None,
+            mam_seq: 0,
+            mam_pending: std::collections::HashMap::new(),
+            mam_catchup: std::collections::HashMap::new(),
+            mam_caught_up: std::collections::HashSet::new(),
             reconnecting: false,
             reconnect_attempts: 0,
             reconnect_jid: None,

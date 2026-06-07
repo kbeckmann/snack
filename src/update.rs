@@ -12,6 +12,11 @@ use crate::room::backlog::{ self, Backlog };
 use crate::storage::history::History;
 use crate::{ room, storage, xmpp };
 
+// Safety cap on forward catch-up: stops a pathologically large sync (e.g. after
+// a very long offline stretch) from paging the whole archive in one go. Any
+// history beyond this is still reachable by scrolling up.
+const CATCHUP_MAX_PAGES: u32 = 40;
+
 fn send_notification(summary: &str, body: &str)
 {
     if let Err(e) = notify_rust::Notification::new()
@@ -69,7 +74,8 @@ fn seed_tail_for(history: &Option<History>, conv: &str, b: &mut dyn Backlog)
     if let Some(h) = history
     {
         let tail = h.load_tail(conv, backlog::LIVE_TAIL_CAP);
-        let has_older = tail.first().is_some_and(|m| h.has_older(conv, m.id));
+        let has_older = tail.first()
+            .is_some_and(|m| h.has_older(conv, m.received.timestamp_millis(), m.id));
         b.seed_tail(tail, has_older);
     }
     else
@@ -141,21 +147,192 @@ impl Snack
             return false;
         }
         let Some(before_id) = b.oldest_loaded_id() else { return false; };
+        let Some(before_ts) = b.oldest_received().map(|t| t.timestamp_millis()) else { return false; };
         let Some(h) = &self.history else { return false; };
 
-        let older = h.load_older(&jid, before_id, backlog::PAGE_SIZE);
+        let older = h.load_older(&jid, before_ts, before_id, backlog::PAGE_SIZE);
         if older.is_empty()
         {
             if let Some(b) = self.active_backlog_mut() { b.set_has_older(false); }
             return false;
         }
-        let new_has_older = older.first().is_some_and(|m| h.has_older(&jid, m.id));
+        let new_has_older = older.first()
+            .is_some_and(|m| h.has_older(&jid, m.received.timestamp_millis(), m.id));
 
         if let Some(b) = self.active_backlog_mut()
         {
             b.prepend_older(older, new_has_older);
         }
         return true;
+    }
+
+    fn backlog_by_jid(&self, jid: &str) -> Option<&dyn Backlog>
+    {
+        if let Some(r) = self.rooms.iter().find(|r| r.jid == jid) { return Some(r as &dyn Backlog); }
+        if let Some(c) = self.chats.iter().find(|c| c.jid == jid) { return Some(c as &dyn Backlog); }
+        return None;
+    }
+
+    fn backlog_by_jid_mut(&mut self, jid: &str) -> Option<&mut dyn Backlog>
+    {
+        if let Some(i) = self.rooms.iter().position(|r| r.jid == jid)
+        {
+            return Some(&mut self.rooms[i] as &mut dyn Backlog);
+        }
+        if let Some(i) = self.chats.iter().position(|c| c.jid == jid)
+        {
+            return Some(&mut self.chats[i] as &mut dyn Backlog);
+        }
+        return None;
+    }
+
+    // Load the next older page from the local DB into the named conversation's
+    // window and prepend it. Returns how many messages were loaded.
+    fn load_older_into(&mut self, jid: &str) -> usize
+    {
+        let cursor = self.backlog_by_jid(jid)
+            .and_then(|b| b.oldest_loaded_id().zip(b.oldest_received()));
+        let Some((before_id, before_ts)) = cursor else { return 0; };
+        let before_ts = before_ts.timestamp_millis();
+        let Some(h) = &self.history else { return 0; };
+
+        let older = h.load_older(jid, before_ts, before_id, backlog::PAGE_SIZE);
+        let n = older.len();
+        if n == 0 { return 0; }
+        let new_has_older = older.first()
+            .is_some_and(|m| h.has_older(jid, m.received.timestamp_millis(), m.id));
+
+        if let Some(b) = self.backlog_by_jid_mut(jid)
+        {
+            b.prepend_older(older, new_has_older);
+        }
+        return n;
+    }
+
+    // Page older history from the server archive (XEP-0313 MAM) for the active
+    // conversation, when the local DB is exhausted, the server archive isn't,
+    // nothing is already in flight, and we are connected.
+    fn fetch_archive_active(&mut self)
+    {
+        if self.xmpp_cmd_tx.is_none() || self.history.is_none()
+        {
+            return;
+        }
+        let Some(sel) = self.active else { return; };
+
+        let (jid, is_muc) = match sel
+        {
+            Selection::Room(i) => match self.rooms.get(i) { Some(r) => (r.jid.clone(), true), None => return },
+            Selection::Chat(i) => match self.chats.get(i) { Some(c) => (c.jid.clone(), false), None => return },
+        };
+
+        let (cursor, end) = match self.backlog_by_jid(&jid)
+        {
+            Some(b) if !b.mam_in_flight() && !b.mam_exhausted()
+                && b.messages().len() < backlog::MAX_LOADED =>
+            {
+                let cursor = b.mam_cursor();
+                // Bound only the first page by our oldest known message; later
+                // pages follow the RSM cursor.
+                let end = if cursor.is_none()
+                {
+                    b.oldest_received().map(|t| t.to_rfc3339())
+                }
+                else
+                {
+                    None
+                };
+                (cursor, end)
+            }
+            _ => return,
+        };
+
+        // "mam-b-" marks a backward scroll-up query; catch-up uses "mam-c-".
+        let query_id = format!("mam-b-{}", self.mam_seq);
+        self.mam_seq = self.mam_seq.wrapping_add(1);
+        self.mam_pending.insert(query_id.clone(), jid.clone());
+        if let Some(b) = self.backlog_by_jid_mut(&jid) { b.set_mam_in_flight(true); }
+
+        let (to, with) = if is_muc { (Some(jid.clone()), None) } else { (None, Some(jid.clone())) };
+        if let Some(tx) = &self.xmpp_cmd_tx
+        {
+            let _ = tx.try_send(xmpp::XmppCommand::QueryArchive
+            {
+                query_id,
+                to,
+                with,
+                start: None,
+                end,
+                forward: false,
+                cursor,
+                max: backlog::PAGE_SIZE as u32,
+            });
+        }
+    }
+
+    // Catch up history missed while offline. Sweeps the recent server archive
+    // BACKWARDS from the present (not forward from our newest message — an
+    // offline gap sits in the *middle* of the timeline, older than the most
+    // recent messages we already hold). The sweep stops once a page yields no
+    // new messages, i.e. it has reached contiguous local history. Triggered when
+    // a room is joined or a conversation selected.
+    fn start_catchup(&mut self, conv: &str)
+    {
+        if self.xmpp_cmd_tx.is_none()
+        {
+            return;
+        }
+        // One sweep per conversation per session.
+        if self.mam_catchup.contains_key(conv) || self.mam_caught_up.contains(conv)
+        {
+            return;
+        }
+        // With no local history there is no gap to bridge; a fresh conversation
+        // is filled by scrolling up instead.
+        let have_history = self.history.as_ref()
+            .is_some_and(|h| h.newest_received(conv).is_some());
+        if !have_history
+        {
+            return;
+        }
+
+        self.mam_catchup.insert(conv.to_string(), (0, 0));
+        // First page: most recent (empty <before/>), no cursor.
+        self.send_catchup_page(conv, None);
+    }
+
+    // Send one backward catch-up page; `cursor` is the RSM `before` id (None for
+    // the most recent page).
+    fn send_catchup_page(&mut self, conv: &str, cursor: Option<String>)
+    {
+        let is_muc = self.rooms.iter().any(|r| r.jid == conv);
+        let (to, with) = if is_muc
+        {
+            (Some(conv.to_string()), None)
+        }
+        else
+        {
+            (None, Some(conv.to_string()))
+        };
+
+        let query_id = format!("mam-c-{}", self.mam_seq);
+        self.mam_seq = self.mam_seq.wrapping_add(1);
+        self.mam_pending.insert(query_id.clone(), conv.to_string());
+
+        if let Some(tx) = &self.xmpp_cmd_tx
+        {
+            let _ = tx.try_send(xmpp::XmppCommand::QueryArchive
+            {
+                query_id,
+                to,
+                with,
+                start: None,
+                end: None,
+                forward: false,
+                cursor,
+                max: backlog::PAGE_SIZE as u32,
+            });
+        }
     }
 
     // Re-run the find search against the DB for the current query and scope,
@@ -235,8 +412,10 @@ impl Snack
         if let Some(h) = &self.history
         {
             let window = h.load_window_around(&conv, m.id, ctx, ctx);
-            let has_older = window.first().is_some_and(|w| h.has_older(&conv, w.id));
-            let at_tail = window.last().is_none_or(|w| !h.has_newer(&conv, w.id));
+            let has_older = window.first()
+                .is_some_and(|w| h.has_older(&conv, w.received.timestamp_millis(), w.id));
+            let at_tail = window.last()
+                .is_none_or(|w| !h.has_newer(&conv, w.received.timestamp_millis(), w.id));
             if let Some(b) = self.active_backlog_mut()
             {
                 b.set_window(window, has_older, at_tail);
@@ -675,6 +854,16 @@ impl Snack
                         self.reconnecting = false;
                         self.reconnect_attempts = 0;
 
+                        // Any MAM query that was outstanding when the link dropped
+                        // will never complete; clear the in-flight flags so paging
+                        // can resume after a reconnect. Re-arm catch-up so the
+                        // freshly-reconnected session backfills the new gap.
+                        self.mam_pending.clear();
+                        self.mam_catchup.clear();
+                        self.mam_caught_up.clear();
+                        for r in self.rooms.iter_mut() { r.mam_in_flight = false; }
+                        for c in self.chats.iter_mut() { c.mam_in_flight = false; }
+
                         let jid = self.connected_jid.clone().unwrap_or_default();
 
                         // Persist or clear saved login depending on the checkbox.
@@ -810,6 +999,9 @@ impl Snack
                     }
                     xmpp::XmppEvent::RoomJoined { room: jid, members } =>
                     {
+                        // `jid` is moved into the room entry below; keep a copy for
+                        // the catch-up trigger at the end.
+                        let conv_jid = jid.clone();
                         self.joining_room = None;
                         self.join_error = None;
 
@@ -862,6 +1054,9 @@ impl Snack
                                 has_older: false,
                                 at_live_tail: true,
                                 anchored_bottom: true,
+                                mam_in_flight: false,
+                                mam_exhausted: false,
+                                mam_cursor: None,
                             });
 
                             let i = self.rooms.len() - 1;
@@ -881,6 +1076,11 @@ impl Snack
                         {
                             self.load_draft(sel);
                         }
+
+                        // Fill any history missed while we were away (offline gap)
+                        // by catching up the server archive forward from our last
+                        // stored message.
+                        self.start_catchup(&conv_jid);
 
                         self.show_join_panel = false;
                         return Task::batch([snap_to_bottom(), focus_input()]);
@@ -1109,6 +1309,9 @@ impl Snack
                                     has_older: false,
                                     at_live_tail: true,
                                     anchored_bottom: true,
+                                    mam_in_flight: false,
+                                    mam_exhausted: false,
+                                    mam_cursor: None,
                                 });
                                 let i = self.chats.len() - 1;
                                 seed_tail_for(&self.history, &conv, &mut self.chats[i]);
@@ -1166,6 +1369,119 @@ impl Snack
                         }
                         return Task::none();
                     }
+                    xmpp::XmppEvent::ArchiveMessage { query_id, from, body, timestamp } =>
+                    {
+                        let Some(conv) = self.mam_pending.get(&query_id).cloned() else
+                        {
+                            return Task::none();
+                        };
+
+                        // Derive the sender the same way live ingest does: a MUC
+                        // archive carries room/nick; a 1:1 archive carries the full
+                        // JID of either party.
+                        let is_muc = self.rooms.iter().any(|r| r.jid == conv);
+                        let sender = if is_muc
+                        {
+                            from.rsplit('/').next().unwrap_or(&from).to_string()
+                        }
+                        else
+                        {
+                            let from_bare = from.split('/').next().unwrap_or(&from);
+                            let own_bare = self.connected_jid.as_deref()
+                                .map(|j| j.split('/').next().unwrap_or(j))
+                                .unwrap_or("");
+                            if from_bare == own_bare
+                            {
+                                self.connected_jid.as_deref()
+                                    .and_then(|j| j.split('@').next())
+                                    .unwrap_or("me")
+                                    .to_string()
+                            }
+                            else
+                            {
+                                self.chats.iter().find(|c| c.jid == conv)
+                                    .map(|c| c.title.clone())
+                                    .unwrap_or_else(|| from_bare.split('@').next().unwrap_or(from_bare).to_string())
+                            }
+                        };
+
+                        // Persist (deduplicating); the window is updated in bulk
+                        // when the query completes.
+                        let stored = self.persist_message(&conv, &sender, &body, timestamp, true);
+
+                        // For a catch-up sweep, tally newly-stored messages in the
+                        // current page so the sweep can stop once a page is all
+                        // duplicates (contiguous local history reached).
+                        if query_id.starts_with("mam-c-") && stored.is_some()
+                        {
+                            if let Some(state) = self.mam_catchup.get_mut(&conv)
+                            {
+                                state.1 += 1;
+                            }
+                        }
+                    }
+                    xmpp::XmppEvent::ArchiveComplete { query_id, complete, first, last: _ } =>
+                    {
+                        let Some(conv) = self.mam_pending.remove(&query_id) else
+                        {
+                            return Task::none();
+                        };
+
+                        if query_id.starts_with("mam-c-")
+                        {
+                            // Catch-up sweep: keep walking backward while pages are
+                            // still producing new messages (the offline gap), and
+                            // stop once a page is all duplicates — we've reached
+                            // history we already hold.
+                            let (pages, new_in_page) = self.mam_catchup.get(&conv).copied().unwrap_or((0, 0));
+                            let pages = pages + 1;
+                            if !complete && new_in_page > 0 && pages < CATCHUP_MAX_PAGES
+                            {
+                                if let Some(before) = first
+                                {
+                                    self.mam_catchup.insert(conv.clone(), (pages, 0));
+                                    self.send_catchup_page(&conv, Some(before));
+                                    return Task::none();
+                                }
+                            }
+
+                            // Sweep finished for this conversation.
+                            self.mam_catchup.remove(&conv);
+                            self.mam_caught_up.insert(conv.clone());
+
+                            // If parked at the bottom of this conversation, reseed
+                            // so the freshly back-filled history shows right away;
+                            // otherwise it appears on the next scroll/reselect.
+                            if self.active_conv_jid().as_deref() == Some(conv.as_str())
+                                && self.active_backlog().is_some_and(|b| b.anchored_bottom())
+                            {
+                                match self.active
+                                {
+                                    Some(Selection::Room(i)) => seed_tail_for(&self.history, &conv, &mut self.rooms[i]),
+                                    Some(Selection::Chat(i)) => seed_tail_for(&self.history, &conv, &mut self.chats[i]),
+                                    None => {}
+                                }
+                                return snap_to_bottom();
+                            }
+                            return Task::none();
+                        }
+
+                        // Backward (scroll-up) paging: pull what was stored into
+                        // the window and advance the older-cursor.
+                        let loaded = self.load_older_into(&conv);
+                        if let Some(b) = self.backlog_by_jid_mut(&conv)
+                        {
+                            b.set_mam_in_flight(false);
+                            b.set_mam_cursor(first);
+                            // Stop paging when the server reports completion, or
+                            // when a page produced nothing new (guards against
+                            // loops on odd server behaviour).
+                            if complete || loaded == 0
+                            {
+                                b.set_mam_exhausted(true);
+                            }
+                        }
+                    }
                 }
             }
             Message::Disconnect =>
@@ -1178,6 +1494,9 @@ impl Snack
                 self.connected_jid = None;
                 self.rooms.clear();
                 self.chats.clear();
+                self.mam_pending.clear();
+                self.mam_catchup.clear();
+                self.mam_caught_up.clear();
                 self.active = None;
                 self.message_input = text_editor::Content::new();
                 self.show_join_panel = false;
@@ -1231,6 +1550,9 @@ impl Snack
                 {
                     let conv = self.rooms[index].jid.clone();
                     seed_tail_for(&self.history, &conv, &mut self.rooms[index]);
+                    // Backfill any offline gap for this room the first time it is
+                    // opened this session.
+                    self.start_catchup(&conv);
                 }
 
                 if changed
@@ -1263,6 +1585,7 @@ impl Snack
                 {
                     let conv = self.chats[index].jid.clone();
                     seed_tail_for(&self.history, &conv, &mut self.chats[index]);
+                    self.start_catchup(&conv);
                 }
 
                 if changed
@@ -1294,6 +1617,9 @@ impl Snack
                             has_older: false,
                             at_live_tail: true,
                             anchored_bottom: true,
+                            mam_in_flight: false,
+                            mam_exhausted: false,
+                            mam_cursor: None,
                         });
                         let i = self.chats.len() - 1;
                         seed_tail_for(&self.history, &conv, &mut self.chats[i]);
@@ -1676,7 +2002,11 @@ impl Snack
                 {
                     // Page older history in at the front; the bottom anchor keeps
                     // the user's current content visually fixed across the prepend.
-                    self.page_older_active();
+                    // When the local DB is exhausted, reach to the server archive.
+                    if !self.page_older_active()
+                    {
+                        self.fetch_archive_active();
+                    }
                 }
             }
             Message::ToggleFind =>

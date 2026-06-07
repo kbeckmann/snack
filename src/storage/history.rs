@@ -97,8 +97,7 @@ impl History
                  live          INTEGER NOT NULL,
                  UNIQUE(conversation, sender, body, ts)
              );
-             CREATE INDEX IF NOT EXISTS idx_msg_conv_id ON messages(conversation, id);
-             CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON messages(conversation, ts);",
+             CREATE INDEX IF NOT EXISTS idx_msg_conv_ts ON messages(conversation, ts, id);",
         );
     }
 
@@ -163,6 +162,12 @@ impl History
         return Some(self.conn.last_insert_rowid());
     }
 
+    // Chronological ordering is by (ts, id): `ts` is the message time and `id`
+    // breaks ties. We must NOT order by `id` alone, because messages back-filled
+    // from the server archive (MAM) are chronologically older yet are inserted
+    // later and so receive higher ids. `(ts, id)` keeps the archive interleaved
+    // in the right place.
+
     // The most recent `limit` messages of a conversation, oldest-first (ready to
     // append straight into a render buffer).
     pub fn load_tail(&self, conversation: &str, limit: usize) -> Vec<StoredMessage>
@@ -170,19 +175,19 @@ impl History
         return self.query_desc_then_reverse(
             "SELECT id, sender, body, ts FROM messages
              WHERE conversation = ?1
-             ORDER BY id DESC LIMIT ?2",
+             ORDER BY ts DESC, id DESC LIMIT ?2",
             params![conversation, limit as i64],
         );
     }
 
-    // The `limit` messages immediately older than `before_id`, oldest-first.
-    pub fn load_older(&self, conversation: &str, before_id: i64, limit: usize) -> Vec<StoredMessage>
+    // The `limit` messages immediately older than the (ts, id) cursor, oldest-first.
+    pub fn load_older(&self, conversation: &str, before_ts: i64, before_id: i64, limit: usize) -> Vec<StoredMessage>
     {
         return self.query_desc_then_reverse(
             "SELECT id, sender, body, ts FROM messages
-             WHERE conversation = ?1 AND id < ?2
-             ORDER BY id DESC LIMIT ?3",
-            params![conversation, before_id, limit as i64],
+             WHERE conversation = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3))
+             ORDER BY ts DESC, id DESC LIMIT ?4",
+            params![conversation, before_ts, before_id, limit as i64],
         );
     }
 
@@ -197,31 +202,60 @@ impl History
         after: usize,
     ) -> Vec<StoredMessage>
     {
-        let mut out = self.load_older(conversation, center_id, before);
+        let Some(center_ts) = self.message_ts(center_id) else { return Vec::new(); };
+
+        let mut out = self.load_older(conversation, center_ts, center_id, before);
 
         let newer = self.query_asc(
             "SELECT id, sender, body, ts FROM messages
-             WHERE conversation = ?1 AND id >= ?2
-             ORDER BY id ASC LIMIT ?3",
-            params![conversation, center_id, (after + 1) as i64],
+             WHERE conversation = ?1 AND (ts > ?2 OR (ts = ?2 AND id >= ?3))
+             ORDER BY ts ASC, id ASC LIMIT ?4",
+            params![conversation, center_ts, center_id, (after + 1) as i64],
         );
         out.extend(newer);
         return out;
     }
 
-    pub fn has_older(&self, conversation: &str, before_id: i64) -> bool
+    // Timestamp of the most recent stored message for a conversation, used as
+    // the `start` bound when catching up missed history from the server.
+    pub fn newest_received(&self, conversation: &str) -> Option<DateTime<Utc>>
+    {
+        return self.conn
+            .query_row(
+                "SELECT max(ts) FROM messages WHERE conversation = ?1",
+                params![conversation],
+                |r| r.get::<_, Option<i64>>(0),
+            )
+            .optional()
+            .ok()
+            .flatten()
+            .flatten()
+            .map(to_dt);
+    }
+
+    fn message_ts(&self, id: i64) -> Option<i64>
+    {
+        return self.conn
+            .query_row("SELECT ts FROM messages WHERE id = ?1", params![id], |r| r.get(0))
+            .optional()
+            .unwrap_or(None);
+    }
+
+    pub fn has_older(&self, conversation: &str, before_ts: i64, before_id: i64) -> bool
     {
         return self.exists(
-            "SELECT 1 FROM messages WHERE conversation = ?1 AND id < ?2 LIMIT 1",
-            params![conversation, before_id],
+            "SELECT 1 FROM messages
+             WHERE conversation = ?1 AND (ts < ?2 OR (ts = ?2 AND id < ?3)) LIMIT 1",
+            params![conversation, before_ts, before_id],
         );
     }
 
-    pub fn has_newer(&self, conversation: &str, after_id: i64) -> bool
+    pub fn has_newer(&self, conversation: &str, after_ts: i64, after_id: i64) -> bool
     {
         return self.exists(
-            "SELECT 1 FROM messages WHERE conversation = ?1 AND id > ?2 LIMIT 1",
-            params![conversation, after_id],
+            "SELECT 1 FROM messages
+             WHERE conversation = ?1 AND (ts > ?2 OR (ts = ?2 AND id > ?3)) LIMIT 1",
+            params![conversation, after_ts, after_id],
         );
     }
 
@@ -236,13 +270,13 @@ impl History
         {
             "SELECT id, conversation FROM messages
              WHERE conversation = ?2 AND body LIKE ?1 ESCAPE '\\'
-             ORDER BY id ASC LIMIT ?3"
+             ORDER BY ts ASC, id ASC LIMIT ?3"
         }
         else
         {
             "SELECT id, conversation FROM messages
              WHERE body LIKE ?1 ESCAPE '\\'
-             ORDER BY id ASC LIMIT ?2"
+             ORDER BY ts ASC, id ASC LIMIT ?2"
         };
 
         let mut stmt = match self.conn.prepare(sql)
@@ -394,11 +428,46 @@ mod tests
 
         let tail = h.load_tail("room", 3);
         assert_eq!(tail.iter().map(|m| m.body.clone()).collect::<Vec<_>>(), vec!["m7", "m8", "m9"]);
-        assert!(h.has_older("room", tail[0].id));
+        let cur = &tail[0];
+        assert!(h.has_older("room", cur.received.timestamp_millis(), cur.id));
 
-        let older = h.load_older("room", tail[0].id, 3);
+        let older = h.load_older("room", cur.received.timestamp_millis(), cur.id, 3);
         assert_eq!(older.iter().map(|m| m.body.clone()).collect::<Vec<_>>(), vec!["m4", "m5", "m6"]);
-        assert!(!h.has_newer("room", tail[2].id));
+        let last = &tail[2];
+        assert!(!h.has_newer("room", last.received.timestamp_millis(), last.id));
+    }
+
+    #[test]
+    fn archive_backfill_orders_by_time_not_id()
+    {
+        let h = History::open_in_memory();
+        // Live messages arrive in time order (ids 1,2,3 == times 100,101,102).
+        h.insert("room", "u", "live-a", at(100), false);
+        h.insert("room", "u", "live-b", at(101), false);
+        h.insert("room", "u", "live-c", at(102), false);
+
+        // Now back-fill OLDER history from the server archive: inserted later, so
+        // these get higher ids (4,5) despite older timestamps.
+        let old1 = h.insert("room", "u", "old-1", at(50), true).unwrap();
+        let _old2 = h.insert("room", "u", "old-2", at(51), true).unwrap();
+        assert!(old1 > 3, "backfilled rows get higher ids");
+
+        // The tail must still be the newest BY TIME, not by id.
+        let tail = h.load_tail("room", 3);
+        assert_eq!(
+            tail.iter().map(|m| m.body.clone()).collect::<Vec<_>>(),
+            vec!["live-a", "live-b", "live-c"],
+        );
+
+        // Paging older than the tail front yields the backfilled history in
+        // chronological order.
+        let front = &tail[0];
+        let older = h.load_older("room", front.received.timestamp_millis(), front.id, 10);
+        assert_eq!(
+            older.iter().map(|m| m.body.clone()).collect::<Vec<_>>(),
+            vec!["old-1", "old-2"],
+        );
+        assert!(!h.has_older("room", older[0].received.timestamp_millis(), older[0].id));
     }
 
     #[test]
