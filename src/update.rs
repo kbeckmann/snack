@@ -972,6 +972,13 @@ impl Snack
                 {
                     error!("Failed to open URL {}: {}", url, e);
                 }
+                // Clicking the link unfocuses the message input; restore it so
+                // the user can keep typing without a manual click after the
+                // browser steals window focus.
+                if self.is_message_input_context()
+                {
+                    return focus_input();
+                }
             }
             Message::WindowUnfocused =>
             {
