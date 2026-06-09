@@ -35,7 +35,18 @@ pub fn view(state: &Snack) -> Element<'_, Message>
 
     if state.reconnecting
     {
-        account_col = account_col.push(text("Reconnecting…").size(11));
+        let retry_btn = button(text("Reconnect now").size(11))
+            .on_press(Message::ForceReconnect)
+            .padding(4)
+            .style(button::text);
+
+        account_col = account_col.push(
+            row![
+                text("Reconnecting…").size(11),
+                text("").width(Fill),
+                retry_btn,
+            ].align_y(iced::Alignment::Center).width(Fill)
+        );
     }
 
     let account_row = account_col.push(action_row);

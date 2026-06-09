@@ -358,6 +358,25 @@ impl Snack
 
                 return Task::none();
             }
+            Message::ForceReconnect =>
+            {
+                // Manual "get me out of a stuck reconnect". Reset the backoff and
+                // immediately stand up a brand-new connection: Reconnect swaps in
+                // a fresh command channel, which restarts the xmpp subscription
+                // and its tokio runtime + reader thread from scratch. Any stalled
+                // in-flight attempt is detached and reaped by its setup timeout.
+                if self.reconnect_jid.is_some() && self.reconnect_password.is_some()
+                {
+                    self.reconnecting = true;
+                    self.reconnect_attempts = 0;
+                    self.connect_error = None;
+                    // Drop the current (possibly wedged) channel so the stale
+                    // subscription stops before the new one starts.
+                    self.xmpp_cmd_tx = None;
+                    self.xmpp_cmd_rx = None;
+                    return Task::done(Message::Reconnect);
+                }
+            }
             Message::CancelConnect =>
             {
                 self.state = AppState::Login;

@@ -17,6 +17,9 @@ pub enum Message
     FocusPassword,
     Connect,
     Reconnect,
+    // User-triggered immediate reconnect: bypasses the backoff and abandons a
+    // stuck in-flight attempt by starting a fresh connection from scratch.
+    ForceReconnect,
     CancelConnect,
     XmppEvent(xmpp::XmppEvent),
     Disconnect,
