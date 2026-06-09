@@ -2,6 +2,13 @@ use iced::futures::SinkExt;
 use iced::stream;
 use log::{ debug, error };
 use std::sync::{ Arc, Mutex };
+use std::time::Duration;
+
+// Upper bound on connecting + authenticating + binding. A reconnect fired right
+// after wake (before WireGuard/the network is back) would otherwise block here
+// forever; bounding it lets the app's reconnect backoff retry until the network
+// returns.
+const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
 
 #[derive(Debug)]
 pub enum XmppCommand
@@ -119,12 +126,26 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
 
             rt.block_on(async move
             {
-                let (mut client, mut event_rx) = match ::xmpp::XmppClient::new(&jid, &password).await
+                // Connection setup (TCP connect, TLS, SASL, resource bind) has no
+                // internal timeout, and the wake-from-sleep heartbeat below only
+                // starts once setup succeeds. So if we reconnect right after waking
+                // — before WireGuard/the network is back — the setup reads would
+                // block forever with no detection and no retry. Bound it so a
+                // stalled attempt fails and the app's backoff loop tries again.
+                let setup = ::xmpp::XmppClient::new(&jid, &password);
+                let (mut client, mut event_rx) = match tokio::time::timeout(SETUP_TIMEOUT, setup).await
                 {
-                    Ok(x) => x,
-                    Err(e) =>
+                    Ok(Ok(x)) => x,
+                    Ok(Err(e)) =>
                     {
                         let _ = bridge_tx.send(XmppEvent::Disconnected(e.to_string())).await;
+                        return;
+                    }
+                    Err(_) =>
+                    {
+                        let _ = bridge_tx.send(XmppEvent::Disconnected(
+                            format!("Connection attempt timed out after {}s.", SETUP_TIMEOUT.as_secs())
+                        )).await;
                         return;
                     }
                 };
