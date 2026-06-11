@@ -1651,9 +1651,16 @@ impl Snack
                     return Task::none();
                 }
 
-                // No live channel (e.g. waiting to reconnect): keep the user's
-                // text rather than silently discarding it.
+                // Only send when fully connected and not mid-reconnect. During a
+                // reconnect `xmpp_cmd_tx` is a fresh channel but the socket isn't
+                // established and rooms aren't rejoined yet, so a queued send would
+                // be written to a dead socket or ordered before the rejoin and
+                // dropped by the server — and room messages have no local echo, so
+                // it would vanish without a trace. Keep the user's text in the
+                // input instead, so they can resend once the connection is back.
                 if self.xmpp_cmd_tx.is_none()
+                    || self.reconnecting
+                    || self.state != AppState::Connected
                 {
                     return focus_input();
                 }
