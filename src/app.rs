@@ -126,6 +126,9 @@ pub struct Snack
     // marks conversations swept this session so re-selecting doesn't re-sync.
     pub(crate) mam_catchup: std::collections::HashMap<String, (u32, u32)>,
     pub(crate) mam_caught_up: std::collections::HashSet<String>,
+    // Decreasing counter handing out negative temporary ids for optimistically-
+    // shown outgoing room messages, until the server echo gives them a real id.
+    pub(crate) pending_seq: i64,
     // Auto-reconnect: when an established session drops (e.g. after the laptop
     // wakes from sleep) we transparently retry with exponential backoff instead
     // of dumping the user back to the login screen. Credentials are stashed so
@@ -173,6 +176,7 @@ impl Snack
             mam_pending: std::collections::HashMap::new(),
             mam_catchup: std::collections::HashMap::new(),
             mam_caught_up: std::collections::HashSet::new(),
+            pending_seq: -1,
             reconnecting: false,
             reconnect_attempts: 0,
             reconnect_jid: None,

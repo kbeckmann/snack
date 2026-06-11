@@ -9,6 +9,7 @@ use crate::app::{
 };
 use crate::message::Message;
 use crate::room::backlog::{ self, Backlog };
+use crate::room::message::ChatStatus;
 use crate::storage::history::History;
 use crate::{ room, storage, xmpp };
 
@@ -16,6 +17,15 @@ use crate::{ room, storage, xmpp };
 // a very long offline stretch) from paging the whole archive in one go. Any
 // history beyond this is still reachable by scrolling up.
 const CATCHUP_MAX_PAGES: u32 = 40;
+
+// An optimistically-shown outgoing room message stays badge-free for this long,
+// so a normal fast echo never flickers a "sending…" indicator; only a slow send
+// grows one.
+const SEND_PENDING_GRACE: std::time::Duration = std::time::Duration::from_millis(500);
+// If the server hasn't echoed an outgoing message back within this long, show it
+// as failed. Kept generous so a merely-slow connection doesn't false-flag; a late
+// echo still upgrades it back to confirmed regardless.
+const SEND_FAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 fn send_notification(summary: &str, body: &str)
 {
@@ -103,6 +113,63 @@ impl Snack
             Some(h) => h.insert(conversation, sender, body, received, delayed),
             None => Some(-1),
         };
+    }
+
+    // Hand out a fresh negative temp id for an optimistically-shown outgoing message.
+    fn next_pending_id(&mut self) -> i64
+    {
+        self.pending_seq -= 1;
+        return self.pending_seq;
+    }
+
+    // The server echoed one of our own messages: upgrade the matching optimistic
+    // entry (the oldest still-unconfirmed one with the same sender + body) to
+    // Confirmed, adopting the server's row id and timestamp. Returns whether a
+    // match was found, so the caller can skip appending a duplicate.
+    fn confirm_pending(
+        &mut self,
+        room_idx: usize,
+        from: &str,
+        body: &str,
+        db_id: i64,
+        received: chrono::DateTime<chrono::Utc>,
+    ) -> bool
+    {
+        for m in self.rooms[room_idx].messages.iter_mut()
+        {
+            if let room::message::Message::Chat { id, from: f, body: b, received: r, status } = m
+            {
+                if *status != ChatStatus::Confirmed && f == from && b == body
+                {
+                    *id = db_id;
+                    *r = received;
+                    *status = ChatStatus::Confirmed;
+                    return true;
+                }
+            }
+        }
+        return false;
+    }
+
+    // Move the optimistic entry identified by `temp_id` from any of `from_any` to
+    // `to` (no-op if it was already confirmed or trimmed away). Drives the grace
+    // and failure timers.
+    fn transition_pending(&mut self, conv: &str, temp_id: i64, from_any: &[ChatStatus], to: ChatStatus)
+    {
+        if let Some(b) = self.backlog_by_jid_mut(conv)
+        {
+            for m in b.messages_mut().iter_mut()
+            {
+                if let room::message::Message::Chat { id, status, .. } = m
+                {
+                    if *id == temp_id && from_any.contains(status)
+                    {
+                        *status = to;
+                        return;
+                    }
+                }
+            }
+        }
     }
 
     fn active_conv_jid(&self) -> Option<String>
@@ -1219,12 +1286,19 @@ impl Snack
                         let user_is_watching = is_active && self.window_focused;
                         let is_own = nick == own_nick;
 
-                        // Only extend the in-memory window when it is showing the
-                        // live tail AND the user is parked at the bottom. If they
-                        // have scrolled/jumped into history, the message is safely
-                        // in the DB and reappears when they return to the bottom —
-                        // so it never yanks their view.
-                        if self.rooms[idx].at_live_tail && self.rooms[idx].anchored_bottom
+                        // Our own message echoed back: confirm the optimistic entry
+                        // in place (adopting the real id/timestamp) instead of
+                        // appending a duplicate.
+                        if is_own && self.confirm_pending(idx, &nick, &body, db_id, timestamp)
+                        {
+                            // Already on screen since we sent it; nothing to add.
+                        }
+                        // Otherwise extend the in-memory window, but only when it's
+                        // showing the live tail AND the user is parked at the bottom.
+                        // If they've scrolled/jumped into history, the message is
+                        // safely in the DB and reappears on return — never yanking
+                        // their view.
+                        else if self.rooms[idx].at_live_tail && self.rooms[idx].anchored_bottom
                         {
                             self.rooms[idx].append_live(room::message::Message::Chat
                             {
@@ -1232,6 +1306,7 @@ impl Snack
                                 from: nick.clone(),
                                 body: body.clone(),
                                 received: timestamp,
+                                status: ChatStatus::Confirmed,
                             });
 
                             // New-message index after any trim performed by append_live.
@@ -1337,6 +1412,7 @@ impl Snack
                                 from: nick,
                                 body: body.clone(),
                                 received: timestamp,
+                                status: ChatStatus::Confirmed,
                             });
 
                             if !user_is_watching
@@ -1669,12 +1745,12 @@ impl Snack
                 {
                     Some(Selection::Room(index)) =>
                     {
+                        let room_jid = self.rooms[index].jid.clone();
                         if let Some(ref tx) = self.xmpp_cmd_tx
                         {
-                            let room_jid = self.rooms[index].jid.clone();
                             if tx.try_send(xmpp::XmppCommand::SendRoomMessage
                             {
-                                room: room_jid,
+                                room: room_jid.clone(),
                                 body: body.clone(),
                             }).is_err()
                             {
@@ -1682,14 +1758,32 @@ impl Snack
                             }
                         }
 
-                        // Reattach to the live tail (the server will echo our
-                        // message back, which then appends to the window).
+                        // Reattach to the live tail so the optimistic message (and
+                        // the eventual echo) land in view.
                         if !self.rooms[index].at_live_tail
                         {
-                            let conv = self.rooms[index].jid.clone();
-                            seed_tail_for(&self.history, &conv, &mut self.rooms[index]);
+                            seed_tail_for(&self.history, &room_jid, &mut self.rooms[index]);
                         }
                         self.rooms[index].set_anchored_bottom(true);
+
+                        // Show the message right away as Sending. The server echo
+                        // confirms it in place (confirm_pending); the grace timer
+                        // reveals a "sending…" badge only if it's slow, and the
+                        // failure timer flags it if no echo ever arrives.
+                        let own_nick = self.connected_jid
+                            .as_deref()
+                            .and_then(|j| j.split('@').next())
+                            .unwrap_or("me")
+                            .to_string();
+                        let temp_id = self.next_pending_id();
+                        self.rooms[index].append_live(room::message::Message::Chat
+                        {
+                            id: temp_id,
+                            from: own_nick,
+                            body: body.clone(),
+                            received: chrono::Utc::now(),
+                            status: ChatStatus::Sending,
+                        });
 
                         self.message_input = text_editor::Content::new();
                         self.nick_complete = None;
@@ -1698,7 +1792,20 @@ impl Snack
                             self.persist_drafts();
                         }
 
-                        return Task::batch([snap_to_bottom(), focus_input()]);
+                        return Task::batch([
+                            snap_to_bottom(),
+                            focus_input(),
+                            delay_then(SEND_PENDING_GRACE, Message::MarkSendPending
+                            {
+                                conversation: room_jid.clone(),
+                                temp_id,
+                            }),
+                            delay_then(SEND_FAIL_TIMEOUT, Message::MarkSendFailed
+                            {
+                                conversation: room_jid,
+                                temp_id,
+                            }),
+                        ]);
                     }
                     Some(Selection::Chat(index)) =>
                     {
@@ -1736,6 +1843,7 @@ impl Snack
                                 from: own_nick,
                                 body,
                                 received,
+                                status: ChatStatus::Confirmed,
                             });
 
                             let new_index = self.chats[index].messages.len() - 1;
@@ -1766,6 +1874,22 @@ impl Snack
                     }
                     None => {}
                 }
+            }
+            Message::MarkSendPending { conversation, temp_id } =>
+            {
+                // Grace period elapsed without an echo: reveal the "sending…" badge.
+                self.transition_pending(&conversation, temp_id, &[ChatStatus::Sending], ChatStatus::Pending);
+            }
+            Message::MarkSendFailed { conversation, temp_id } =>
+            {
+                // Timed out without an echo: flag it. A late echo still upgrades it
+                // back to Confirmed via confirm_pending.
+                self.transition_pending(
+                    &conversation,
+                    temp_id,
+                    &[ChatStatus::Sending, ChatStatus::Pending],
+                    ChatStatus::Failed,
+                );
             }
             Message::ShowJoinPanel =>
             {

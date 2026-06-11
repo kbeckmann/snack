@@ -28,6 +28,11 @@ pub enum Message
     StartChat(String),
     InputAction(text_editor::Action),
     SendMessage,
+    // Delayed checks on an optimistically-shown outgoing message (keyed by its
+    // negative temp id): show the "sending…" badge once the grace period passes,
+    // and mark it failed if no server echo confirms it before the timeout.
+    MarkSendPending { conversation: String, temp_id: i64 },
+    MarkSendFailed { conversation: String, temp_id: i64 },
     ShowJoinPanel,
     HideJoinPanel,
     JoinInputChanged(String),

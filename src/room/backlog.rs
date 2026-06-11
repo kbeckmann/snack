@@ -18,7 +18,7 @@
 
 use chrono::{ DateTime, Utc };
 
-use crate::room::message::Message;
+use crate::room::message::{ ChatStatus, Message };
 use crate::storage::history::StoredMessage;
 
 // Messages kept in memory at the live tail. Bounds steady-state render cost.
@@ -39,6 +39,7 @@ fn to_message(s: StoredMessage) -> Message
         from: s.sender,
         body: s.body,
         received: s.received,
+        status: ChatStatus::Confirmed,
     };
 }
 
