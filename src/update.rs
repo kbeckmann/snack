@@ -1785,6 +1785,12 @@ impl Snack
                             status: ChatStatus::Sending,
                         });
 
+                        // Sending means the user is caught up; clear the read
+                        // marker so their own message isn't stranded under a
+                        // "new messages" divider.
+                        self.rooms[index].read_marker = None;
+                        self.rooms[index].unread = false;
+
                         self.message_input = text_editor::Content::new();
                         self.nick_complete = None;
                         if self.clear_active_draft()
