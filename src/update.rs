@@ -53,9 +53,6 @@ impl Snack
                 if let Some(r) = self.rooms.get_mut(old_idx)
                 {
                     r.read_marker = Some(r.messages.len());
-                    // The user has seen this room's replayed-history divider;
-                    // dismiss it so it doesn't linger on the next visit.
-                    r.history_marker = None;
                 }
             }
             Some(Selection::Chat(old_idx)) if next != Some(Selection::Chat(old_idx)) =>
@@ -541,8 +538,14 @@ impl Snack
                             // event (libxmpp flushes RoomJoined before the buffered
                             // backlog). Mark the boundary so a divider separates the
                             // old chat from that replayed history, which can repeat
-                            // messages we already have.
-                            self.rooms[pos].history_marker = Some(self.rooms[pos].messages.len());
+                            // messages we already have. Skip if we already have a
+                            // marker at this exact spot (e.g. a reconnect with no
+                            // new messages since the last one).
+                            let boundary = self.rooms[pos].messages.len();
+                            if self.rooms[pos].history_markers.last() != Some(&boundary)
+                            {
+                                self.rooms[pos].history_markers.push(boundary);
+                            }
                         }
                         else
                         {
@@ -563,7 +566,7 @@ impl Snack
                                 messages: Vec::new(),
                                 unread: false,
                                 read_marker: None,
-                                history_marker: None,
+                                history_markers: Vec::new(),
                             });
 
                             self.active = Some(Selection::Room(self.rooms.len() - 1));
@@ -730,11 +733,14 @@ impl Snack
                                         self.rooms[idx].read_marker = Some(msg_index + 1);
                                     }
                                 }
-                                if let Some(marker) = self.rooms[idx].history_marker
+                                // Only a marker sitting exactly at this message's slot needs to
+                                // move — earlier reconnect markers stay put so each still lines
+                                // up with the history it originally bounded.
+                                for marker in self.rooms[idx].history_markers.iter_mut()
                                 {
-                                    if marker <= msg_index
+                                    if *marker == msg_index
                                     {
-                                        self.rooms[idx].history_marker = Some(msg_index + 1);
+                                        *marker = msg_index + 1;
                                     }
                                 }
                             }
@@ -984,11 +990,11 @@ impl Snack
                                 self.rooms[index].read_marker = Some(msg_index + 1);
                             }
                         }
-                        if let Some(marker) = self.rooms[index].history_marker
+                        for marker in self.rooms[index].history_markers.iter_mut()
                         {
-                            if marker <= msg_index
+                            if *marker == msg_index
                             {
-                                self.rooms[index].history_marker = Some(msg_index + 1);
+                                *marker = msg_index + 1;
                             }
                         }
 
