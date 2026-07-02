@@ -12,9 +12,9 @@ pub struct Room
     pub unread: bool,
     // Index of the first message that arrived while this room was not being watched.
     pub read_marker: Option<usize>,
-    // Index of the first message in the history the server replays after a
-    // reconnect re-join. These messages can repeat ones already in `messages`,
-    // so a divider here separates the old chat from the replayed "new history".
-    // Cleared once the user navigates away from the room.
-    pub history_marker: Option<usize>,
+    // Index of the first message in each backlog the server replays after a
+    // reconnect re-join, one entry per reconnect. These messages can repeat
+    // ones already in `messages`, so a divider is shown at each index to
+    // separate the old chat from that replayed "new history".
+    pub history_markers: Vec<usize>,
 }

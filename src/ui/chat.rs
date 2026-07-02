@@ -56,7 +56,7 @@ fn divider<'a>(label: &str, color: Color) -> Element<'a, Message>
 fn render_messages<'a>(
     msgs: &'a [RoomMessage],
     read_marker: Option<usize>,
-    history_marker: Option<usize>,
+    history_markers: &[usize],
     my_nick: Option<&str>,
 ) -> Element<'a, Message>
 {
@@ -79,18 +79,19 @@ fn render_messages<'a>(
     for (i, m) in msgs.iter().enumerate()
     {
         // Insert a "reconnected — history below" divider before the first message
-        // of the backlog the server replayed after a reconnect, so it's clear
+        // of each backlog the server replayed after a reconnect, so it's clear
         // where the already-seen chat ends and the (possibly overlapping) new
-        // history begins.
-        if history_marker == Some(i) && i < msgs.len()
+        // history begins. One reconnect during the session can produce several
+        // of these dividers.
+        if history_markers.contains(&i) && i < msgs.len()
         {
             messages.push(divider("reconnected — history below", Color::from_rgb(0.42, 0.52, 0.62)));
         }
 
         // Insert a "new messages" divider before the first new message — unless it
-        // would land at the same spot as the reconnected-history divider, which
+        // would land at the same spot as a reconnected-history divider, which
         // already marks where the unseen messages begin. Stacking both is noise.
-        if read_marker == Some(i) && history_marker != Some(i) && i < msgs.len()
+        if read_marker == Some(i) && !history_markers.contains(&i) && i < msgs.len()
         {
             messages.push(divider("new messages", Color::from_rgb(0.60, 0.40, 0.40)));
         }
@@ -307,7 +308,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
                 .width(Fill)
                 .style(container::bordered_box);
 
-            let messages = render_messages(&room.messages, room.read_marker, room.history_marker, my_nick);
+            let messages = render_messages(&room.messages, room.read_marker, &room.history_markers, my_nick);
 
             return column![topic_label, messages, input_row(state)]
                 .spacing(8)
@@ -337,7 +338,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
                 .style(container::bordered_box);
 
             // Direct-message chats get no reconnect-history replay, so no divider.
-            let messages = render_messages(&chat.messages, chat.read_marker, None, my_nick);
+            let messages = render_messages(&chat.messages, chat.read_marker, &[], my_nick);
 
             return column![header, messages, input_row(state)]
                 .spacing(8)
