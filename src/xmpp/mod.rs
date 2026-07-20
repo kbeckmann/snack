@@ -18,6 +18,9 @@ const PING_TIMEOUT: Duration = Duration::from_secs(10);
 /// resource bind). Without this a reconnect fired before the network is back
 /// (e.g. right after wake-from-sleep) blocks forever on a dead socket.
 const SETUP_TIMEOUT: Duration = Duration::from_secs(30);
+/// XEP-0115 caps node advertised in outgoing presence, identifying snack as the
+/// software behind the capabilities it reports via XEP-0030 service discovery.
+const CAPS_NODE: &str = "https://github.com/mikaelsahlstrom/snack";
 
 #[derive(Debug)]
 pub enum XmppCommand
@@ -150,6 +153,42 @@ async fn drain_until_signal(cmd_rx: &mut tokio::sync::mpsc::Receiver<XmppCommand
     return BackoffWait::Closed;
 }
 
+/// Advertise snack's real XEP-0030 service-discovery identity and features, then
+/// re-broadcast presence so the XEP-0115 entity-capabilities hash peers cache
+/// reflects snack rather than libxmpp's defaults. Called after every (re)connect,
+/// since each fresh client starts from libxmpp's default disco.
+async fn advertise_capabilities(client: &::xmpp::XmppClient)
+{
+    client.set_disco_info(::xmpp::DiscoInfo
+    {
+        identities: vec![::xmpp::DiscoIdentity
+        {
+            category: "client".to_string(),
+            kind: "pc".to_string(),
+            name: Some("snack".to_string()),
+        }],
+        // The namespaces snack actually implements: the caps/disco/ping features
+        // libxmpp answers on our behalf, MUC group chat, and XEP-0203 delayed
+        // delivery, which we understand on incoming messages.
+        features: vec![
+            "http://jabber.org/protocol/caps".to_string(),
+            "http://jabber.org/protocol/disco#info".to_string(),
+            "http://jabber.org/protocol/disco#items".to_string(),
+            "http://jabber.org/protocol/muc".to_string(),
+            "urn:xmpp:ping".to_string(),
+            "urn:xmpp:delay".to_string(),
+        ],
+    });
+    client.set_caps_node(CAPS_NODE);
+
+    // Re-advertise: changing the feature set changed the caps `ver` hash, so peers
+    // need the fresh presence to refresh their cached view of our capabilities.
+    if let Err(e) = client.send_presence().await
+    {
+        error!("Failed to broadcast capabilities presence: {}", e);
+    }
+}
+
 /// Run one established session until it ends. Multiplexes server events, UI
 /// commands, and a keep-alive ping that detects a silently half-open socket.
 /// `established` distinguishes a fresh login from a reconnect so the server's
@@ -202,9 +241,13 @@ async fn run_session(
                             {
                                 Some(XmppEvent::MemberLeft { room, nick })
                             }
-                            ::xmpp::XmppEvent::RoomMessage { room, nick, body, timestamp } =>
+                            ::xmpp::XmppEvent::RoomMessage { room, nick, body, delay } =>
                             {
-                                let ts = timestamp
+                                // XEP-0203: a delayed message (replayed MUC history)
+                                // carries the original send time in its `<delay/>`;
+                                // a live message has no delay, so stamp it now.
+                                let ts = delay
+                                    .and_then(|d| d.stamp)
                                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                                     .map(|dt| dt.with_timezone(&chrono::Utc))
                                     .unwrap_or_else(chrono::Utc::now);
@@ -218,9 +261,13 @@ async fn run_session(
                             {
                                 Some(XmppEvent::PresenceError { from, condition, text })
                             }
-                            ::xmpp::XmppEvent::DirectMessage { from, body, timestamp } =>
+                            ::xmpp::XmppEvent::DirectMessage { from, body, delay } =>
                             {
-                                let ts = timestamp
+                                // XEP-0203: a delayed one-to-one message (e.g. stored
+                                // while we were offline) carries its original send time
+                                // in `<delay/>`; a live message has none, so use now.
+                                let ts = delay
+                                    .and_then(|d| d.stamp)
                                     .and_then(|s| chrono::DateTime::parse_from_rfc3339(&s).ok())
                                     .map(|dt| dt.with_timezone(&chrono::Utc))
                                     .unwrap_or_else(chrono::Utc::now);
@@ -287,9 +334,22 @@ async fn run_session(
             _ = ping.tick() =>
             {
                 // A half-open socket never surfaces a read error, so probe it.
-                if let Err(e) = client.ping(None, PING_TIMEOUT).await
+                // When XEP-0198 stream management is negotiated, request a stream
+                // acknowledgement instead of a ping: the returned `<a/>` both proves
+                // the link is alive and confirms the server has processed every
+                // stanza we've sent — a stronger guarantee than a bare ping.
+                let probe = if client.is_stream_management_enabled()
                 {
-                    error!("Keep-alive ping failed, treating session as dropped: {}", e);
+                    client.request_ack(PING_TIMEOUT).await
+                }
+                else
+                {
+                    client.ping(None, PING_TIMEOUT).await.map(|_| ())
+                };
+
+                if let Err(e) = probe
+                {
+                    error!("Keep-alive probe failed, treating session as dropped: {}", e);
                     break SessionOutcome::Dropped;
                 }
             }
@@ -369,6 +429,11 @@ pub fn connect(cmd: CommandChannel) -> impl iced::futures::Stream<Item = XmppEve
                         Ok((client, event_rx)) =>
                         {
                             backoff = INITIAL_BACKOFF;
+
+                            // XEP-0030/0115: replace libxmpp's default disco with
+                            // snack's own identity and features before the session
+                            // starts handling traffic.
+                            advertise_capabilities(&client).await;
 
                             let outcome = run_session(client, event_rx, &mut cmd_rx, &bridge_tx, &nick, established).await;
                             established = true;
