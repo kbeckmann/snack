@@ -11,6 +11,8 @@ use log::warn;
 use serde::{ Deserialize, Serialize };
 
 pub mod history;
+#[cfg(all(target_os = "macos", not(test)))]
+mod sealed_password;
 
 const KEYRING_SERVICE: &str = "snack";
 const CONFIG_FILE: &str = "config.toml";
@@ -426,7 +428,7 @@ pub(crate) fn fail_next_password_operation(jid: &str, error: keyring_core::Error
     entry.as_any().downcast_ref::<keyring_core::mock::Cred>().unwrap().set_error(error);
 }
 
-pub fn load_password(jid: &str) -> Result<Option<String>, String>
+fn load_keyring_password(jid: &str) -> Result<Option<String>, String>
 {
     match password_entry(jid).and_then(|entry| entry.get_password()) {
         Ok(password) => Ok(Some(password)),
@@ -435,13 +437,14 @@ pub fn load_password(jid: &str) -> Result<Option<String>, String>
     }
 }
 
-pub fn save_password(jid: &str, password: &str) -> Result<(), String>
+#[cfg(not(all(target_os = "macos", not(test))))]
+fn save_keyring_password(jid: &str, password: &str) -> Result<(), String>
 {
     let entry = password_entry(jid).map_err(|e| e.to_string())?;
     return entry.set_password(password).map_err(|e| e.to_string());
 }
 
-pub fn delete_password(jid: &str) -> Result<(), String>
+fn delete_keyring_password(jid: &str) -> Result<(), String>
 {
     let entry = password_entry(jid).map_err(|e| e.to_string())?;
     match entry.delete_credential() {
@@ -449,6 +452,73 @@ pub fn delete_password(jid: &str) -> Result<(), String>
         Err(error) => Err(error.to_string()),
     }
 }
+
+// On macOS, saved passwords are sealed to a Secure Enclave key and opened with
+// Touch ID. The login keychain trusts an unsigned build only by its exact hash,
+// so it would ask for the keychain password after every rebuild.
+#[cfg(all(target_os = "macos", not(test)))]
+fn sealed_password_path(jid: &str) -> Result<PathBuf, String>
+{
+    use sha2::{Digest, Sha256};
+    let dir = config_path().and_then(|path| path.parent().map(|parent| parent.join("credentials")))
+        .ok_or("Cannot locate Snack's configuration directory")?;
+    let digest = Sha256::digest(bare_account(jid).as_bytes());
+    let name: String = digest.iter().map(|byte| format!("{byte:02x}")).collect();
+    Ok(dir.join(format!("{name}.sealed")))
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+pub fn load_password(jid: &str) -> Result<Option<String>, String>
+{
+    let path = sealed_password_path(jid)?;
+    match fs::read(&path) {
+        Ok(sealed) => {
+            log::debug!("Opening the saved password for {jid} with Touch ID");
+            return match sealed_password::open(&sealed, &format!("unlock the saved password for {}", bare_account(jid))) {
+                Ok(password) => Ok(Some(password)),
+                Err(sealed_password::OpenError::Cancelled) => Err("Unlocking the saved password was cancelled.".into()),
+                Err(sealed_password::OpenError::Failed(error)) => Err(format!("Could not unlock the saved password: {error}")),
+            };
+        }
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not read the saved password: {error}")),
+    }
+    // Move a password saved in the keychain by an earlier version. The old
+    // item is left in place; forgetting the login removes it.
+    let Some(password) = load_keyring_password(jid)? else { return Ok(None); };
+    match sealed_password::seal(&password).and_then(|sealed| save_config_file(&path, &sealed).map_err(|e| e.to_string())) {
+        Ok(()) => log::info!("Moved the saved password for {jid} from the keychain to Touch ID protection"),
+        Err(error) => log::warn!("Keeping the saved password in the keychain: {error}"),
+    }
+    Ok(Some(password))
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+pub fn save_password(jid: &str, password: &str) -> Result<(), String>
+{
+    let sealed = sealed_password::seal(password)?;
+    save_config_file(&sealed_password_path(jid)?, &sealed).map_err(|e| format!("Could not save the password: {e}"))
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+pub fn delete_password(jid: &str) -> Result<(), String>
+{
+    match fs::remove_file(sealed_password_path(jid)?) {
+        Ok(()) => {}
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("Could not delete the saved password: {error}")),
+    }
+    delete_keyring_password(jid)
+}
+
+#[cfg(not(all(target_os = "macos", not(test))))]
+pub fn load_password(jid: &str) -> Result<Option<String>, String> { load_keyring_password(jid) }
+
+#[cfg(not(all(target_os = "macos", not(test))))]
+pub fn save_password(jid: &str, password: &str) -> Result<(), String> { save_keyring_password(jid, password) }
+
+#[cfg(not(all(target_os = "macos", not(test))))]
+pub fn delete_password(jid: &str) -> Result<(), String> { delete_keyring_password(jid) }
 
 // Persist the user's intent before touching the credential. A failed cleanup
 // must not leave a remembered login or disappear on application restart.
