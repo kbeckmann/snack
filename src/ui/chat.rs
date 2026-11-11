@@ -246,10 +246,12 @@ fn render_messages_at_width<'a>(
                             })
                             .style(style::body_editor)
                             .size(14)
+                            // Break long URLs and hashes instead of overflowing.
+                            .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
                             .padding(0)
                             .into(), id, dragging, content.selection().is_some())
                     }
-                    None => text(body).size(14).width(Fill).into(),
+                    None => text(body).size(14).wrapping(iced::widget::text::Wrapping::WordOrGlyph).width(Fill).into(),
                 };
 
                 let message_id = *id;
@@ -369,7 +371,7 @@ fn render_messages_at_width<'a>(
                     },
                 };
 
-                let event_label = text(event_text).size(14).color(event_color).width(Fill);
+                let event_label = text(event_text).size(14).color(event_color).wrapping(iced::widget::text::Wrapping::WordOrGlyph).width(Fill);
 
                 let event_row = row![time_label, event_label].spacing(4).width(Fill);
                 let event_element: Element<'a, Message> = container(event_row)
@@ -427,6 +429,7 @@ fn input_row(state: &Snack) -> Element<'_, Message>
     let input = text_editor(&state.message_input)
         .id(Id::new(MESSAGE_INPUT_ID))
         .placeholder("Type a message...")
+        .wrapping(iced::widget::text::Wrapping::WordOrGlyph)
         .on_action(Message::InputAction)
         .key_binding(move |press|
         {

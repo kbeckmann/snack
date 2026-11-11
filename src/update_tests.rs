@@ -11111,3 +11111,45 @@ fn never_attempted_queued_sends_replay_without_an_archive_lookup() {
     assert!(delivery_check(&commands).is_none());
     assert!(commands.iter().any(|command| matches!(command, xmpp::XmppCommand::SendDirectMessage { id: sent, .. } if *sent == id)));
 }
+
+#[test]
+fn long_unbroken_words_wrap_inside_the_transcript_and_composer() {
+    use iced::advanced::widget::operation::{Operation, Focusable};
+    #[derive(Default)]
+    struct Editors { body: Option<iced::Rectangle>, composer: Option<iced::Rectangle> }
+    impl Operation for Editors {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) { operate(self); }
+        fn focusable(&mut self, id: Option<&iced::widget::Id>, bounds: iced::Rectangle, _state: &mut dyn Focusable) {
+            if id == Some(&iced::widget::Id::new(MESSAGE_INPUT_ID)) { self.composer = Some(bounds); } else { self.body = Some(bounds); }
+        }
+    }
+    // A short sentence followed by a URL far wider than the pane, as when
+    // sharing a commit link with a long anchor.
+    let url = format!("https://example.org/project/commit/{}#diff-{}", "a1b2c3d4".repeat(5), "0123456789abcdef".repeat(4));
+    let body = format!("a little code {url} :)");
+    let mut s = state();
+    s.chats[0] = chat("alice@example", &[&body]);
+    s.body_editors.clear();
+    s.sync_body_editors();
+    s.message_input = text_editor::Content::with_text(&url);
+    let editors_at = |width: f32| {
+        let mut widget = crate::ui::chat::view(&s);
+        let mut tree = Tree::new(&widget);
+        let r = renderer();
+        let size = iced::Size::new(width, 600.0);
+        let node = widget.as_widget_mut().layout(&mut tree, &r, &layout::Limits::new(size, size));
+        let mut editors = Editors::default();
+        widget.as_widget_mut().operate(&mut tree, Layout::new(&node), &r, &mut editors);
+        (editors.body.expect("message body"), editors.composer.expect("composer"))
+    };
+    let (narrow_body, narrow_composer) = editors_at(400.0);
+    let (wide_body, wide_composer) = editors_at(800.0);
+    // Even the wide pane cannot fit the URL on one line, so word wrapping
+    // alone would leave it overflowing at the same height in both panes.
+    // Breaking it inside the word makes the narrow pane need more lines.
+    // At 400px the ~135-character URL alone needs several body lines.
+    assert!(narrow_body.height >= 5.0 * 18.0, "body did not wrap the URL: {narrow_body:?}");
+    assert!(narrow_body.height > wide_body.height, "body did not wrap the URL: {narrow_body:?} vs {wide_body:?}");
+    assert!(narrow_composer.height > wide_composer.height, "composer did not wrap the URL: {narrow_composer:?} vs {wide_composer:?}");
+    assert!(narrow_body.x + narrow_body.width <= 400.0 && narrow_composer.x + narrow_composer.width <= 400.0);
+}
