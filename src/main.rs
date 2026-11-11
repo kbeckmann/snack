@@ -5,6 +5,7 @@ use iced::{ Application, Program, Theme };
 mod app;
 mod edit_history;
 mod instance;
+mod logging;
 mod notifications;
 mod message;
 mod room;
@@ -74,11 +75,7 @@ fn init_logging()
         "info"
     };
 
-    env_logger::Builder::from_env(
-        env_logger::Env::default().default_filter_or(default_filter),
-    )
-    .format_timestamp_millis()
-    .init();
+    logging::init(default_filter);
 }
 
 fn application() -> Application<impl Program<Message = Message, Theme = Theme>>
