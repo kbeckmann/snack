@@ -4386,6 +4386,13 @@ impl Snack
                     None => {}
                 }
             }
+            Message::ActivateWindow =>
+            {
+                return iced::window::oldest().then(|window| match window {
+                    Some(id) => Task::batch([iced::window::minimize(id, false), iced::window::gain_focus(id)]),
+                    None => Task::none(),
+                });
+            }
             Message::WindowFocused =>
             {
                 self.window_focused = true;

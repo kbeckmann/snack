@@ -4,6 +4,7 @@ use iced::{ Application, Program, Theme };
 
 mod app;
 mod edit_history;
+mod instance;
 mod notifications;
 mod message;
 mod room;
@@ -21,10 +22,14 @@ pub use app::{
 };
 pub use message::Message;
 
-fn main() -> iced::Result
+fn main() -> Result<(), Box<dyn std::error::Error>>
 {
     init_logging();
-    return application().run();
+    // Keep the OS lock until the UI and its worker subscriptions have stopped.
+    // A secondary launch only requests activation; it never loads user state.
+    let Some(_instance) = instance::acquire()? else { return Ok(()); };
+    application().run()?;
+    Ok(())
 }
 
 /// Default to `debug` for snack + libxmpp when built without

@@ -179,6 +179,7 @@ pub enum Message
     RetrySavedLogin,
     RetryConfigLoad,
     RecoverConfiguration,
+    ActivateWindow,
     WindowFocused,
     WindowUnfocused,
     WindowCloseRequested(iced::window::Id),

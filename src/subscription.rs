@@ -16,6 +16,7 @@ impl Snack
         // We disable exit-on-close so we can flush in-progress drafts to disk
         // before the window actually closes.
         let window_close = iced::window::close_requests().map(Message::WindowCloseRequested);
+        let activation = iced::Subscription::run(crate::instance::activation_events);
 
         let command_retry = if self.xmpp_pending_commands.is_empty() {
             iced::Subscription::none()
@@ -47,9 +48,9 @@ impl Snack
                     },
                 );
 
-                return iced::Subscription::batch([keyboard, window_focus, window_close, command_retry, history_retry, xmpp_sub]);
+                return iced::Subscription::batch([keyboard, window_focus, window_close, activation, command_retry, history_retry, xmpp_sub]);
             }
-            _ => return iced::Subscription::batch([keyboard, window_focus, window_close, command_retry, history_retry]),
+            _ => return iced::Subscription::batch([keyboard, window_focus, window_close, activation, command_retry, history_retry]),
         }
     }
 }
