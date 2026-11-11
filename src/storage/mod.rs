@@ -8,6 +8,10 @@ use keyring_core::Entry;
 use log::warn;
 use serde::{ Deserialize, Serialize };
 
+// The account history store is used by the conversation integration that follows.
+#[allow(dead_code)]
+pub mod history;
+
 const KEYRING_SERVICE: &str = "snack";
 const CONFIG_FILE: &str = "config.toml";
 
@@ -149,4 +153,16 @@ pub fn delete_password(jid: &str) -> Result<(), String>
             Ok(())
         }
     };
+}
+
+pub(super) fn create_directory(path: &std::path::Path) -> io::Result<()>
+{
+    let mut builder = fs::DirBuilder::new();
+    builder.recursive(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::DirBuilderExt;
+        builder.mode(0o700);
+    }
+    builder.create(path)
 }
