@@ -47,6 +47,7 @@ system shortcuts work. Alt-Up/Down stay reserved for switching conversations.
 | Move / select by word | Alt-Left/Right (+Shift) | Ctrl-Left/Right (+Shift) |
 | Line start / end | Cmd-Left/Right (+Shift) | Home / End (+Shift) |
 | Start / end of the message | Cmd-Up/Down (+Shift) | Ctrl-Home/End (+Shift) |
+| Extend the selection to a point | Shift-click | Shift-click |
 | Select to start / end | Shift-Up on the first line, Shift-Down on the last, Shift-Home/End | Ctrl-Shift-Home/End |
 | Paragraph | Alt-Shift-Up/Down selects | Ctrl-Up/Down (+Shift) |
 | Delete word | Alt-Backspace / Alt-Delete | Ctrl-Backspace / Ctrl-Delete |

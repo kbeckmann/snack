@@ -1656,6 +1656,59 @@ fn close_shortcut_closes_direct_chats_from_composer_or_transcript_but_never_leav
     assert!(rx.try_recv().is_err());
 }
 
+// Press and release the mouse in the composer, `x` pixels into its text.
+fn composer_click(s: &Snack, x: f32) -> Vec<Message> {
+    use iced::advanced::widget::operation::{Operation, Focusable};
+    struct Composer(Option<iced::Rectangle>);
+    impl Operation for Composer {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) { operate(self); }
+        fn focusable(&mut self, id: Option<&iced::widget::Id>, bounds: iced::Rectangle, _state: &mut dyn Focusable) {
+            if id == Some(&iced::widget::Id::new(crate::app::MESSAGE_INPUT_ID)) { self.0 = Some(bounds); }
+        }
+    }
+    let mut widget = crate::ui::chat::view(s);
+    let mut tree = Tree::new(&widget);
+    let r = renderer();
+    let size = iced::Size::new(600.0, 400.0);
+    let bounds = iced::Rectangle::new(iced::Point::ORIGIN, size);
+    let node = widget.as_widget_mut().layout(&mut tree, &r, &layout::Limits::new(size, size));
+    let mut composer = Composer(None);
+    widget.as_widget_mut().operate(&mut tree, Layout::new(&node), &r, &mut composer);
+    let composer = composer.0.expect("composer");
+    let point = iced::Point::new(composer.x + 10.0 + x, composer.center_y());
+    let mut messages = Vec::new();
+    for event in [iced::mouse::Event::ButtonPressed(iced::mouse::Button::Left), iced::mouse::Event::ButtonReleased(iced::mouse::Button::Left)] {
+        widget.as_widget_mut().update(&mut tree, &iced::Event::Mouse(event), Layout::new(&node), iced::mouse::Cursor::Available(point), &r,
+            &mut iced::advanced::clipboard::Null, &mut iced::advanced::Shell::new(&mut messages), &bounds);
+    }
+    messages
+}
+
+#[test]
+fn shift_click_in_the_composer_selects_from_the_caret_to_the_click() {
+    let mut s = state();
+    s.state = AppState::Connected;
+    s.message_input = text_editor::Content::with_text("hello brave new world");
+    for message in composer_click(&s, 1.0) { let _ = s.update(message); }
+    assert_eq!(s.message_input.cursor().position.column, 0);
+    assert!(s.message_input.selection().is_none());
+
+    let _ = s.update(Message::ModifiersUpdate { shift: true, primary: false });
+    for message in composer_click(&s, 80.0) { let _ = s.update(message); }
+    let first = s.message_input.selection().expect("shift-click selects");
+    assert!(first.len() > 3 && "hello brave new world".starts_with(&first), "{first:?}");
+
+    // A further shift-click keeps the original anchor and extends the range.
+    for message in composer_click(&s, 140.0) { let _ = s.update(message); }
+    let extended = s.message_input.selection().expect("still selected");
+    assert!(extended.len() > first.len() && extended.starts_with(&first), "{first:?} -> {extended:?}");
+
+    // Without Shift, a click just places the caret.
+    let _ = s.update(Message::ModifiersUpdate { shift: false, primary: false });
+    for message in composer_click(&s, 1.0) { let _ = s.update(message); }
+    assert!(s.message_input.selection().is_none());
+}
+
 #[test]
 fn uppercase_primary_shortcuts_work_without_shift() {
     for modifiers in [iced::keyboard::Modifiers::COMMAND] {

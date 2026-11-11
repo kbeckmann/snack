@@ -3857,6 +3857,13 @@ impl Snack
             }
             Message::InputAction(action) =>
             {
+                // Shift-click extends the selection from the caret (or the
+                // existing selection's anchor) to the click, as in native
+                // text fields. Iced's editor treats it as a plain click.
+                let action = match action {
+                    text_editor::Action::Click(point) if self.shift_down => text_editor::Action::Drag(point),
+                    action => action,
+                };
                 self.clear_body_selection();
                 self.selected_msgs.clear();
                 self.select_anchor = None;
