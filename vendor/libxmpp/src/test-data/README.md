@@ -1,0 +1,1 @@
+Public test certificates from tokio-rustls 0.26.4 (MIT/Apache-2.0), tests/certs. No private keys are included. The leaf is valid for foobar.com through 4096; tests use a later verification time to exercise expiry.

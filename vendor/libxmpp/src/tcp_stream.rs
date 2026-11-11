@@ -1,10 +1,81 @@
+use std::sync::Arc;
+
 use tokio::io::{ AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf };
 use tokio::net::TcpStream;
-use tokio_rustls::rustls::pki_types::ServerName;
-use tokio_rustls::rustls::{ ClientConfig, RootCertStore };
+use tokio_rustls::rustls::client::danger::{ HandshakeSignatureValid, ServerCertVerified, ServerCertVerifier };
+use tokio_rustls::rustls::client::WebPkiServerVerifier;
+use tokio_rustls::rustls::pki_types::{ CertificateDer, ServerName, UnixTime };
+use tokio_rustls::rustls::{ CertificateError, ClientConfig, DigitallySignedStruct, Error, RootCertStore, SignatureScheme };
 use tokio_rustls::TlsConnector;
 
 use crate::error::XmppError;
+
+/// A rustls certificate verifier that performs the normal WebPKI checks
+/// (hostname match, chain of trust, signature) but tolerates a server
+/// certificate that has **expired**. The full verification is repeated at the expiry boundary; every
+/// other validation failure is still rejected, and a warning is logged whenever
+/// an expired cert is accepted so it is never silent. A non-expired (valid) cert
+/// passes the inner verifier and never reaches the relaxed branch, so normal
+/// connections keep full strict validation.
+#[derive(Debug)]
+struct IgnoreExpiredCerts
+{
+    inner: Arc<WebPkiServerVerifier>,
+}
+
+impl ServerCertVerifier for IgnoreExpiredCerts
+{
+    fn verify_server_cert(
+        &self,
+        end_entity: &CertificateDer<'_>,
+        intermediates: &[CertificateDer<'_>],
+        server_name: &ServerName<'_>,
+        ocsp_response: &[u8],
+        now: UnixTime,
+    ) -> Result<ServerCertVerified, Error>
+    {
+        match self.inner.verify_server_cert(end_entity, intermediates, server_name, ocsp_response, now)
+        {
+            Err(Error::InvalidCertificate(CertificateError::ExpiredContext { not_after, .. })) =>
+            {
+                // Verification stops at the first error. Expiry does NOT prove
+                // the chain or hostname passed. Re-run the entire verifier at
+                // the expiry boundary so all remaining checks must succeed.
+                let verified = self.inner.verify_server_cert(
+                    end_entity, intermediates, server_name, ocsp_response, not_after,
+                )?;
+                log::warn!("Accepting expired server TLS certificate after full chain and hostname verification");
+                return Ok(verified);
+            }
+            other => return other,
+        }
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error>
+    {
+        return self.inner.verify_tls12_signature(message, cert, dss);
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &DigitallySignedStruct,
+    ) -> Result<HandshakeSignatureValid, Error>
+    {
+        return self.inner.verify_tls13_signature(message, cert, dss);
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<SignatureScheme>
+    {
+        return self.inner.supported_verify_schemes();
+    }
+}
 
 pub enum Tcp
 {
@@ -66,8 +137,15 @@ impl Tcp
                 let mut root_cert_store = RootCertStore::empty();
                 root_cert_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
+                // Verify normally but tolerate an expired server cert (see
+                // IgnoreExpiredCerts) — hostname/chain/signature are still checked.
+                let webpki = WebPkiServerVerifier::builder(Arc::new(root_cert_store))
+                    .build()
+                    .map_err(|e| XmppError::Tls(format!("building cert verifier: {}", e)))?;
+
                 let config = ClientConfig::builder()
-                    .with_root_certificates(root_cert_store)
+                    .dangerous()
+                    .with_custom_certificate_verifier(Arc::new(IgnoreExpiredCerts { inner: webpki }))
                     .with_no_client_auth();
 
                 let connector = TlsConnector::from(std::sync::Arc::new(config));
@@ -257,5 +335,25 @@ mod tests {
         drop(peer);
         let result = tokio::time::timeout(std::time::Duration::from_secs(2), tcp.add_tls()).await.unwrap();
         assert!(matches!(result, Err(crate::XmppError::Tls(_))), "a valid IP identity must reach the TLS handshake");
+    }
+
+    use super::*;
+    use tokio_rustls::rustls::pki_types::pem::PemObject;
+    fn certificates() -> (IgnoreExpiredCerts, Vec<CertificateDer<'static>>) {
+        let mut roots = RootCertStore::empty();
+        for cert in CertificateDer::pem_slice_iter(include_bytes!("test-data/root.pem")) { roots.add(cert.unwrap()).unwrap(); }
+        let inner = WebPkiServerVerifier::builder(Arc::new(roots)).build().unwrap();
+        let chain = CertificateDer::pem_slice_iter(include_bytes!("test-data/chain.pem")).map(Result::unwrap).collect();
+        (IgnoreExpiredCerts { inner }, chain)
+    }
+    #[test]
+    fn expired_certificate_still_requires_matching_hostname() {
+        let (verifier, chain) = certificates();
+        let now = UnixTime::since_unix_epoch(std::time::Duration::from_secs(100_000_000_000));
+        let valid_name = ServerName::try_from("foobar.com").unwrap();
+        assert!(matches!(verifier.inner.verify_server_cert(&chain[0], &chain[1..], &valid_name, &[], now),
+            Err(Error::InvalidCertificate(CertificateError::ExpiredContext { .. }))));
+        assert!(verifier.verify_server_cert(&chain[0], &chain[1..], &valid_name, &[], now).is_ok());
+        assert!(verifier.verify_server_cert(&chain[0], &chain[1..], &ServerName::try_from("wrong.example").unwrap(), &[], now).is_err());
     }
 }
