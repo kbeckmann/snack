@@ -225,7 +225,7 @@ async fn run_session(
                                 // Connected event, but the UI handles it differently.
                                 Some(if established { XmppEvent::Reconnected } else { XmppEvent::Connected })
                             }
-                            ::xmpp::XmppEvent::RoomJoined { room, members } =>
+                            ::xmpp::XmppEvent::RoomJoined { room, members, .. } =>
                             {
                                 Some(XmppEvent::RoomJoined { room, members })
                             }
@@ -241,7 +241,7 @@ async fn run_session(
                             {
                                 Some(XmppEvent::MemberLeft { room, nick })
                             }
-                            ::xmpp::XmppEvent::RoomMessage { room, nick, body, delay } =>
+                            ::xmpp::XmppEvent::RoomMessage { room, nick, body, delay, .. } =>
                             {
                                 // XEP-0203: a delayed message (replayed MUC history)
                                 // carries the original send time in its `<delay/>`;
@@ -261,7 +261,7 @@ async fn run_session(
                             {
                                 Some(XmppEvent::PresenceError { from, condition, text })
                             }
-                            ::xmpp::XmppEvent::DirectMessage { from, body, delay } =>
+                            ::xmpp::XmppEvent::DirectMessage { from, body, delay, .. } =>
                             {
                                 // XEP-0203: a delayed one-to-one message (e.g. stored
                                 // while we were offline) carries its original send time
