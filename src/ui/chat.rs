@@ -239,6 +239,9 @@ fn render_messages_at_width<'a>(
                                     && !press.modifiers.command() && !press.modifiers.control() && !press.modifiers.alt() {
                                     return Some(text_editor::Binding::Custom(Message::FocusComposer { context }));
                                 }
+                                if is_close_shortcut(&press) {
+                                    return Some(text_editor::Binding::Custom(Message::CloseShortcut { context }));
+                                }
                                 return text_editor::Binding::from_key_press(press);
                             })
                             .style(style::body_editor)
@@ -409,8 +412,16 @@ fn transcript_event(context: uuid::Uuid, selection: uuid::Uuid, search: Option<u
     Message::ScopedTranscript { context, action }
 }
 
+// Cmd-W on macOS, Ctrl-W elsewhere.
+fn is_close_shortcut(press: &text_editor::KeyPress) -> bool
+{
+    press.modifiers.command() && !press.modifiers.shift() && !press.modifiers.alt()
+        && press.key.to_latin(press.physical_key) == Some('w')
+}
+
 fn input_row(state: &Snack) -> Element<'_, Message>
 {
+    let composer = state.composer_id;
     let complete_nicks = state.state == crate::app::AppState::Connected
         && matches!(state.active, Some(Selection::Room(_))) && !state.join_panel_visible();
     let input = text_editor(&state.message_input)
@@ -462,6 +473,10 @@ fn input_row(state: &Snack) -> Element<'_, Message>
                 {
                     return Some(text_editor::Binding::Custom(Message::NextSelection));
                 }
+            }
+            // The focused composer captures keys, so handle Cmd/Ctrl-W here too.
+            if is_close_shortcut(&press) {
+                return Some(text_editor::Binding::Custom(Message::CloseShortcut { context: composer }));
             }
             if let Some(binding) = super::composer_keys::binding(super::composer_keys::CURRENT, &press.key, press.modifiers) {
                 return Some(binding);

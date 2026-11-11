@@ -162,6 +162,8 @@ pub enum Message
     LeaveSelection,
     // Return keyboard focus to the composer, e.g. Tab from the transcript.
     FocusComposer { context: uuid::Uuid },
+    // Cmd/Ctrl-W: closes direct conversations only, never leaves a room.
+    CloseShortcut { context: uuid::Uuid },
     CloseConversation { context: uuid::Uuid },
     OpenUrl(String),
     // Message selection for copy-to-clipboard. `SelectMessage` toggles the chat

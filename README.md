@@ -28,6 +28,7 @@ Use Cmd on macOS and Ctrl on other platforms for the primary shortcuts.
 | Search all open conversations | Enable **All rooms** in the find bar |
 | Next / previous find match | Enter / Shift-Enter in the find bar |
 | Previous / next conversation | Alt-Up / Alt-Down |
+| Close a direct conversation | Cmd/Ctrl-W, from the composer or the transcript; rooms are only left with their **Leave** button |
 | Return to typing from the transcript | Tab |
 | Select part of one or more messages | Drag through message bodies |
 | Select whole messages | Cmd/Ctrl-click a message to show its checked checkbox; then use checkboxes and Shift-click to adjust the range |

@@ -4319,6 +4319,13 @@ impl Snack
                 }
                 return self.update_inner(Message::LeaveSelection);
             }
+            Message::CloseShortcut { context } => {
+                // Cmd/Ctrl-W closes a direct conversation. Leaving a room is
+                // deliberate and needs its Leave button.
+                if context != self.composer_id || self.state != AppState::Connected || self.join_panel_visible()
+                    || !matches!(self.active, Some(Selection::Chat(_))) { return Task::none(); }
+                return self.update_inner(Message::CloseChat);
+            }
             Message::FocusComposer { context } => {
                 if context != self.composer_id || self.active.is_none() || self.join_panel_visible() { return Task::none(); }
                 return focus_input();

@@ -131,7 +131,7 @@ pub(crate) fn keyboard_event(context: uuid::Uuid, event: iced::keyboard::Event) 
             }
             if matches!(&key, iced::keyboard::Key::Character(k) if k.as_str().eq_ignore_ascii_case("w"))
             {
-                return Message::CloseConversation { context };
+                return Message::CloseShortcut { context };
             }
             // Copy selected chat messages to the clipboard. The handler
             // no-ops when nothing is selected, so an ordinary Cmd/Ctrl+C

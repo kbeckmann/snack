@@ -421,6 +421,13 @@ fn current_conversation_close_buttons_and_shortcuts_target_only_the_visible_owne
             let events = if button { transcript_clicks(&s, Some(if rooms { "Leave" } else { "Close" }), 1) } else { vec![shortcut(s.composer_id)] };
             assert!(!events.is_empty());
             for event in events { let _ = s.update(event); }
+            if rooms && !button {
+                // Cmd/Ctrl-W never leaves a room; that needs the Leave button.
+                assert_eq!(s.rooms.len(), 2);
+                assert_eq!(s.saved_config.rooms, [first, second]);
+                assert!(rx.try_recv().is_err());
+                continue;
+            }
             assert_eq!(if rooms { s.rooms.len() } else { s.chats.len() }, 1);
             assert_eq!(s.saved_config.drafts.get(first).map(String::as_str), Some("first preserved draft"));
             if rooms {
@@ -1604,6 +1611,14 @@ fn named_key(key: iced::keyboard::key::Named, modifiers: iced::keyboard::Modifie
     })
 }
 
+fn close_key() -> iced::Event {
+    iced::Event::Keyboard(iced::keyboard::Event::KeyPressed {
+        key: iced::keyboard::Key::Character("w".into()), modified_key: iced::keyboard::Key::Character("w".into()),
+        physical_key: iced::keyboard::key::Physical::Code(iced::keyboard::key::Code::KeyW),
+        location: iced::keyboard::Location::Standard, modifiers: iced::keyboard::Modifiers::COMMAND, text: None, repeat: false,
+    })
+}
+
 #[test]
 fn tab_from_a_focused_message_body_returns_to_the_composer() {
     let mut s = state();
@@ -1615,6 +1630,30 @@ fn tab_from_a_focused_message_body_returns_to_the_composer() {
     // A request from a previous conversation's view does nothing.
     let stale = Message::FocusComposer { context: uuid::Uuid::new_v4() };
     assert_eq!(s.update(stale).units(), 0);
+}
+
+#[test]
+fn close_shortcut_closes_direct_chats_from_composer_or_transcript_but_never_leaves_rooms() {
+    for from_body in [false, true] {
+        let mut s = state();
+        s.state = AppState::Connected;
+        let messages = if from_body { transcript_body_keys(&s, vec![close_key()]) } else { composer_events(&s, vec![close_key()]) };
+        let close: Vec<_> = messages.into_iter().filter(|m| matches!(m, Message::CloseShortcut { .. })).collect();
+        assert!(matches!(close.as_slice(), [Message::CloseShortcut { context }] if *context == s.composer_id),
+            "from_body={from_body}: {close:?}");
+        let _ = s.update(close[0].clone());
+        assert!(s.chats.is_empty(), "from_body={from_body}");
+    }
+
+    let mut s = state();
+    s.state = AppState::Connected;
+    let _ = confirm_room_entry(&mut s, xmpp::XmppEvent::RoomJoined { room: "room@example".into(), own_nick: "me".into(), members: Vec::new() });
+    let _ = s.update(Message::SelectRoom("room@example".into()));
+    let (tx, mut rx) = tokio::sync::mpsc::channel(10);
+    s.xmpp_cmd_tx = Some(tx);
+    for message in composer_events(&s, vec![close_key()]) { let _ = s.update(message); }
+    assert_eq!(s.rooms.len(), 1, "Cmd/Ctrl-W must not leave a room");
+    assert!(rx.try_recv().is_err());
 }
 
 #[test]
