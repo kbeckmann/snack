@@ -87,7 +87,15 @@ impl Tcp
         {
             Self::Disconnected =>
             {
-                let stream = TcpStream::connect((connection_host(&server)?, port)).await?;
+                let host = connection_host(&server)?.to_string();
+                let mut lookups = crate::connection_attempts::AddressLookups::new();
+                lookups.spawn(async move {
+                    tokio::net::lookup_host((host, port)).await
+                        .map(|addresses| addresses.collect()).map_err(XmppError::Io)
+                });
+                // Retain OS connection deadlines for address fallback; the
+                // caller may also cancel its overall connection setup future.
+                let stream = crate::connection_attempts::connect(lookups, None).await?;
 
                 return Ok(Self::Connected(stream, server));
             }

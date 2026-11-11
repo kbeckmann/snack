@@ -2,9 +2,20 @@
 
 An async XMPP client library for Rust, built on Tokio.
 
+Connections discover `_xmpp-client._tcp` SRV records with a small built-in DNS
+client that queries the nameservers in `/etc/resolv.conf`, honoring server
+priority, weight, and port. If SRV lookup yields no service information, or the
+system has no `/etc/resolv.conf` (Windows), the client falls back to the
+account domain on port 5222. An explicit unavailable-service record or failed advertised endpoints
+does not trigger that fallback. STARTTLS certificate verification remains tied
+to the account domain, regardless of the advertised connection host.
+Connection attempts alternate IPv4 and IPv6 addresses with a short stagger,
+so one stalled address does not block the other family. Unused attempts are
+canceled after a connection succeeds or setup is canceled.
+
 ## Features
 
-- TCP + STARTTLS connection handling
+- TCP + STARTTLS connection handling with SRV discovery
 - SASL authentication (SCRAM-SHA-512, SCRAM-SHA-256, SCRAM-SHA-1, PLAIN)
 - Resource binding
 - One-to-one chat messages

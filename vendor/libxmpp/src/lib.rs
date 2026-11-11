@@ -62,6 +62,9 @@ use std::time::Duration;
 
 mod error;
 mod tcp_stream;
+mod discovery;
+mod dns;
+mod connection_attempts;
 mod xml_framer;
 mod stanza;
 pub use stanza::jid_matches;

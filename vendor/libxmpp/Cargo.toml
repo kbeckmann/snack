@@ -48,6 +48,9 @@ version = "0.4.29"
 version = "0.39.2"
 features = ["serialize"]
 
+[dependencies.getrandom]
+version = "0.4"
+
 [dependencies.rand]
 version = "0.10.1"
 

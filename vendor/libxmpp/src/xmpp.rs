@@ -25,8 +25,7 @@ pub async fn setup_connection(event_tx: &mpsc::Sender<XmppEvent>, jid: &str, pas
     let (username, domain) = parse_jid(jid)?;
 
     let _ = event_tx.send(XmppEvent::Connecting).await;
-    let mut tcp = Tcp::new()
-        .connect(domain.to_string(), 5222).await?;
+    let mut tcp = crate::discovery::connect(domain).await?;
 
     let mut framer = XmlFramer::new();
 
