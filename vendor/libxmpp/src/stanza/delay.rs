@@ -27,7 +27,36 @@ impl Delay
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
+        use quick_xml::{events::Event, Reader};
+        let attributes = super::xml::element(xml, b"delay", b"urn:xmpp:delay")?;
+        if attributes.iter().any(|(_, value)| !crate::xml_framer::valid_xml_text(value)) {
+            return Err("Invalid XML character in delay attributes".into());
+        }
+        let attribute = |name| attributes.iter().find(|(key, _)| key == name).map(|(_, value)| value.clone());
+        let normalized_xml = super::xml::normalize_xml(xml)?;
+        let mut reader = Reader::from_str(&normalized_xml);
+        reader.config_mut().expand_empty_elements = true;
+        let mut depth = 0;
+        let mut reason = String::new();
+        loop {
+            match reader.read_event().map_err(|e| e.to_string())? {
+                Event::Start(_) => {
+                    if depth != 0 { return Err("Delay reason must contain text only".into()); }
+                    depth += 1;
+                }
+                Event::End(_) => { depth -= 1; }
+                Event::Text(text) if depth == 1 => reason.push_str(&text.decode().map_err(|e| e.to_string())?),
+                Event::CData(text) if depth == 1 => reason.push_str(&text.decode().map_err(|e| e.to_string())?),
+                Event::GeneralRef(reference) if depth == 1 => {
+                    let reference = format!("&{};", reference.decode().map_err(|e| e.to_string())?);
+                    reason.push_str(&quick_xml::escape::unescape(&reference).map_err(|e| e.to_string())?);
+                }
+                Event::Eof => break,
+                _ => {},
+            }
+        }
+        if !crate::xml_framer::valid_xml_text(&reason) { return Err("Invalid XML character in delay reason".into()); }
+        Ok(Self { stamp: attribute("stamp"), from: attribute("from"), reason: (!reason.is_empty()).then_some(reason) })
     }
 }
 
@@ -35,6 +64,40 @@ impl Delay
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn delay_parser_requires_the_protocol_root_and_namespace() {
+        for xml in [
+            "<delay stamp='2025-01-01T12:00:00Z'/>",
+            "<delay xmlns='urn:unrelated' stamp='2025-01-01T12:00:00Z'/>",
+            "<message xmlns='urn:xmpp:delay' stamp='2025-01-01T12:00:00Z'/>",
+            "<delay xmlns='urn:xmpp:delay'/><delay xmlns='urn:xmpp:delay'/>",
+            "<delay xmlns='urn:xmpp:delay'><nested>reason</nested></delay>",
+            "<delay xmlns='urn:xmpp:delay'>bad&#0;reason</delay>",
+            "<delay xmlns='urn:xmpp:delay' stamp='bad&#0;stamp'/>",
+        ] { assert!(Delay::from_xml(xml).is_err(), "accepted unrelated or malformed delay: {xml}"); }
+    }
+
+    #[test]
+    fn delay_parser_uses_only_unqualified_protocol_attributes() {
+        let delay = Delay::from_xml("<d:delay xmlns:d='urn:xmpp:delay' xmlns:x='urn:other' x:stamp='not a timestamp' x:from='wrong@example' stamp='2025-01-01T12:00:00Z' from='right@example'/>").unwrap();
+        assert_eq!(delay.stamp.as_deref(), Some("2025-01-01T12:00:00Z"));
+        assert_eq!(delay.from.as_deref(), Some("right@example"));
+        let delay = Delay::from_xml("<delay xmlns='urn:xmpp:delay' xmlns:x='urn:other' x:stamp='spoofed'/>").unwrap();
+        assert!(delay.stamp.is_none());
+    }
+
+    #[test]
+    fn standalone_delay_matches_live_message_text_and_attribute_decoding() {
+        let xml = "<d:delay xmlns:d='urn:xmpp:delay' from='a&#x9;b' stamp='2025-01-01T12:00:00Z'>before &amp; <![CDATA[inside\r\nnext]]> after&#xD;end</d:delay>";
+        let standalone = Delay::from_xml(xml).unwrap();
+        let message = super::super::chat::IncomingChatMessage::from_xml(&format!("<message xmlns='jabber:client'>{xml}<body>body</body></message>")).unwrap();
+        let live = message.delay.unwrap();
+        assert_eq!(standalone.stamp, live.stamp);
+        assert_eq!(standalone.from, live.from);
+        assert_eq!(standalone.reason, live.reason);
+        assert_eq!(standalone.reason.as_deref(), Some("before & inside\nnext after\rend"));
+    }
 
     #[test]
     fn parse_full_delay()

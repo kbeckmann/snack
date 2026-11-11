@@ -46,7 +46,9 @@ impl Enabled
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
+        super::xml::empty_element(xml, b"enabled", SM_NS.as_bytes())?;
+        let normalized_xml = super::xml::normalize_xml(xml)?;
+        return quick_xml::de::from_str(&normalized_xml).map_err(|e| e.to_string());
     }
 }
 
@@ -84,8 +86,11 @@ impl Ack
 
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        let parsed: AckElement = quick_xml::de::from_str(xml).map_err(|e| e.to_string())?;
-        return Ok(Self { h: parsed.h });
+        let attributes = super::xml::empty_element(xml, b"a", SM_NS.as_bytes())?;
+        let count = attributes.iter().find(|(name, _)| name == "h")
+            .ok_or("Missing stream acknowledgement count")?;
+        let h = count.1.parse().map_err(|_| "Invalid stream acknowledgement count".to_string())?;
+        return Ok(Self { h });
     }
 
     pub fn h(&self) -> u32
@@ -102,20 +107,25 @@ impl Stanza for Ack
     }
 }
 
-/// The `h` attribute is the only part of an incoming `<a/>` this library needs;
-/// any `xmlns` is ignored (unknown attributes are dropped by the deserializer).
-#[derive(Deserialize)]
-#[serde(rename = "a")]
-struct AckElement
-{
-    #[serde(rename = "@h")]
-    h: u32,
-}
-
 #[cfg(test)]
 mod tests
 {
     use super::*;
+
+    #[test]
+    fn protocol_controls_require_the_correct_root_namespace_and_empty_content()
+    {
+        assert_eq!(Ack::from_xml("<s:a xmlns:s='urn:xmpp:sm:3' h='2'></s:a>").unwrap().h(), 2);
+        assert!(Enabled::from_xml("<s:enabled xmlns:s='urn:xmpp:sm:3'/>").is_ok());
+        for xml in ["<a xmlns='unrelated' h='1'/>", "<a xmlns='urn:xmpp:sm:2' h='1'/>",
+            "<a xmlns='urn:xmpp:sm:3' h='1'><extra/></a>", "<a xmlns='urn:xmpp:sm:3' h='1'>text</a>",
+            "<a xmlns='urn:xmpp:sm:3' h='1' h='2'/>", "<a xmlns='urn:xmpp:sm:3' h='1'/><extra/>",
+            "<a xmlns='urn:xmpp:sm:3' h='1'>"] {
+            assert!(Ack::from_xml(xml).is_err(), "{xml}");
+        }
+        assert!(Enabled::from_xml("<enabled xmlns='unrelated'/>").is_err());
+        assert!(Enabled::from_xml("<failed xmlns='urn:xmpp:sm:3'/>").is_err());
+    }
 
     #[test]
     fn enable_to_xml()
@@ -162,12 +172,9 @@ mod tests
     }
 
     #[test]
-    fn parse_ack_without_xmlns()
+    fn parse_ack_without_xmlns_is_rejected()
     {
-        // Servers often omit the namespace on <a/> once the stream default is
-        // established; the count is all we read.
-        let ack = Ack::from_xml("<a h='0'/>").unwrap();
-        assert_eq!(ack.h(), 0);
+        assert!(Ack::from_xml("<a h='0'/>").is_err());
     }
 
     #[test]

@@ -8,7 +8,16 @@ An async XMPP client library for Rust, built on Tokio.
 - SASL authentication (SCRAM-SHA-512, SCRAM-SHA-256, SCRAM-SHA-1, PLAIN)
 - Resource binding
 - One-to-one chat messages
+- Explicit incoming stanza recipients are checked against the bound account,
+  preserving username/domain aliases and other resources of that account.
+  Forwarded archive recipients are checked separately from their outer envelope.
 - Multi-User Chat (MUC) rooms: join, leave, send and receive group messages
+- Bare-room text is delivered as `RoomServiceMessage`, separately from occupant
+  messages, including normal-type notices from rooms tracked in this connection.
+  Received service text shares entry buffering and remains routable after departure.
+- Room privacy notices (`RoomPrivacy`): publicly logged and non-anonymous room
+  settings reported by confirmed self-presence or live room-service changes.
+  Unknown settings stay unknown; delayed history cannot change current settings.
 - Presence updates and presence-error reporting
 - XEP-0199 ping for keep-alives and connection liveness probing, and
   automatically answering pings from other entities
@@ -99,13 +108,17 @@ async fn main() -> Result<(), xmpp::XmppError>
     {
         match event
         {
-            XmppEvent::RoomJoined { room, members } =>
+            XmppEvent::RoomJoined { room, members, .. } =>
             {
                 println!("joined {} ({} members)", room, members.len());
             }
             XmppEvent::RoomMessage { room, nick, body, .. } =>
             {
                 println!("[{}] {}: {}", room, nick, body);
+            }
+            XmppEvent::RoomServiceMessage { room, body, .. } =>
+            {
+                println!("[{}] room service: {}", room, body);
             }
             XmppEvent::DirectMessage { from, body, .. } =>
             {

@@ -73,8 +73,8 @@ pub(crate) fn caps_element(node: &str, ver: &str) -> String
         "<c xmlns='{}' hash='{}' node='{}' ver='{}'/>",
         CAPS_NS,
         CAPS_HASH,
-        quick_xml::escape::escape(node),
-        quick_xml::escape::escape(ver),
+        super::xml::escape_attribute_value(node),
+        super::xml::escape_attribute_value(ver),
     );
 }
 
@@ -129,44 +129,67 @@ pub struct IncomingCaps
 /// A parsed incoming presence, viewed only for an optional XEP-0115 `<c/>`
 /// capabilities child.
 ///
-/// Deserialises `from` and, when present, the `<c/>` element; every other child
-/// of the presence (show, status, MUC extensions, …) is ignored, so the same
-/// presence can still be parsed by the MUC layer separately.
-#[derive(Deserialize, Debug)]
-#[serde(rename = "presence")]
+/// Reads the unqualified sender and a direct, correctly namespaced `<c/>`.
+/// Other presence children remain available to the MUC layer independently.
+#[derive(Debug)]
 pub struct PresenceCaps
 {
-    #[serde(rename = "@from", default)]
     pub from: Option<String>,
-    #[serde(rename = "$value", default)]
-    children: Vec<PresenceCapsChild>,
-}
-
-#[derive(Deserialize, Debug)]
-#[serde(rename_all = "lowercase")]
-enum PresenceCapsChild
-{
-    C(IncomingCaps),
-    #[serde(other)]
-    Other,
+    caps: Option<IncomingCaps>,
 }
 
 impl PresenceCaps
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
+        use quick_xml::{events::Event, name::ResolveResult, NsReader};
+        let attributes = super::xml::element(xml, b"presence", b"jabber:client")?;
+        let from = attributes.into_iter().find(|(name, _)| name == "from").map(|(_, value)| value);
+        let normalized_xml = crate::stanza::xml::normalize_xml(xml)?;
+        let mut reader = NsReader::from_str(&normalized_xml);
+        reader.config_mut().expand_empty_elements = true;
+        let mut depth = 0usize;
+        let mut caps = None;
+        let mut in_caps = false;
+        loop {
+            match reader.read_resolved_event().map_err(|e| e.to_string())? {
+                (ns, Event::Start(e)) => {
+                    if in_caps { return Err("Capabilities element must be empty".into()); }
+                    if depth == 1 && e.local_name().as_ref() == b"c"
+                        && matches!(ns, ResolveResult::Bound(ns) if ns.as_ref() == CAPS_NS.as_bytes()) {
+                        if caps.is_some() { return Err("Duplicate capabilities element".into()); }
+                        let (mut node, mut ver, mut hash) = (None, None, None);
+                        for attr in e.attributes() {
+                            let attr = attr.map_err(|e| e.to_string())?;
+                            let target = match attr.key.as_ref() {
+                                b"node" => &mut node,
+                                b"ver" => &mut ver,
+                                b"hash" => &mut hash,
+                                _ => continue,
+                            };
+                            *target = Some(attr.unescape_value().map_err(|e| e.to_string())?.into_owned());
+                        }
+                        let node = node.filter(|value| !value.is_empty()).ok_or("Missing capabilities node")?;
+                        let ver = ver.filter(|value| !value.is_empty()).ok_or("Missing capabilities verification string")?;
+                        caps = Some(IncomingCaps { node, ver, hash });
+                        in_caps = true;
+                    }
+                    depth += 1;
+                }
+                (_, Event::End(_)) => {
+                    depth -= 1; // The complete document was validated above.
+                    if depth == 1 { in_caps = false; }
+                }
+                (_, Event::Text(e)) if in_caps && !e.is_empty() => return Err("Capabilities element must be empty".into()),
+                (_, Event::CData(_) | Event::GeneralRef(_)) if in_caps => return Err("Capabilities element must be empty".into()),
+                (_, Event::Eof) => return Ok(Self { from, caps }),
+                _ => {},
+            }
+        }
     }
 
     /// The `<c/>` capabilities element, if the presence carried one.
-    pub fn caps(&self) -> Option<&IncomingCaps>
-    {
-        return self.children.iter().find_map(|child| match child
-        {
-            PresenceCapsChild::C(caps) => Some(caps),
-            PresenceCapsChild::Other => None,
-        });
-    }
+    pub fn caps(&self) -> Option<&IncomingCaps> { self.caps.as_ref() }
 }
 
 #[cfg(test)]
@@ -244,7 +267,7 @@ mod tests
     #[test]
     fn parse_presence_with_caps()
     {
-        let xml = "<presence from='romeo@montague.lit/orchard'>\
+        let xml = "<presence xmlns='jabber:client' from='romeo@montague.lit/orchard'>\
             <c xmlns='http://jabber.org/protocol/caps' hash='sha-1' \
             node='http://code.google.com/p/exodus' ver='QgayPKawpkPSDYmwT/WM94uAlu0='/>\
             </presence>";
@@ -259,10 +282,42 @@ mod tests
     }
 
     #[test]
+    fn capabilities_use_expanded_names_and_unqualified_identity_attributes() {
+        let xml = "<p:presence xmlns:p='jabber:client' xmlns:c='http://jabber.org/protocol/caps' xmlns:e='extension' from='real@example/device' e:from='forged'><e:c node='bad' ver='bad'/><c:c node='real&amp;node' ver='hash' hash='sha-1' e:node='forged'/></p:presence>";
+        let presence = PresenceCaps::from_xml(xml).unwrap();
+        assert_eq!(presence.from.as_deref(), Some("real@example/device"));
+        assert_eq!(presence.caps().unwrap().node, "real&node");
+        for payload in ["<c node='bad' ver='bad'/>", "<c xmlns='extension' node='bad' ver='bad'/>",
+            "<extension><c xmlns='http://jabber.org/protocol/caps' node='nested' ver='bad'/></extension>"] {
+            let xml = format!("<presence xmlns='jabber:client'>{payload}</presence>");
+            assert!(PresenceCaps::from_xml(&xml).unwrap().caps().is_none(), "{xml}");
+        }
+        let presence = PresenceCaps::from_xml("<presence xmlns='jabber:client' xmlns:e='extension' e:from='forged'><c xmlns='http://jabber.org/protocol/caps' node='legacy' ver='version'/></presence>").unwrap();
+        assert!(presence.from.is_none());
+        assert!(presence.caps().unwrap().hash.is_none());
+    }
+
+    #[test]
+    fn capabilities_reject_ambiguous_or_nonempty_payloads() {
+        for payload in [
+            "<c node='one' ver='v'/><c node='two' ver='v'/>",
+            "<c node='one' ver='v'>text</c>", "<c node='one' ver='v'><child/></c>",
+            "<c node='one' ver='v'><![CDATA[text]]></c>", "<c node='one' ver='v'>&amp;</c>",
+            "<c xmlns:e='extension' e:node='forged' ver='v'/>", "<c node='one'/>", "<c node='' ver='v'/>",
+        ] {
+            let xml = format!("<p:presence xmlns:p='jabber:client' xmlns='http://jabber.org/protocol/caps'>{payload}</p:presence>");
+            assert!(PresenceCaps::from_xml(&xml).is_err(), "{xml}");
+        }
+        for xml in ["<presence xmlns='extension'/>", "<presence xmlns='jabber:client'/><extra/>", "<presence xmlns='jabber:client'>"] {
+            assert!(PresenceCaps::from_xml(xml).is_err());
+        }
+    }
+
+    #[test]
     fn parse_presence_without_caps()
     {
         // A plain presence (or one carrying only other extensions) yields no caps.
-        let xml = "<presence from='a@b/c'><show>away</show></presence>";
+        let xml = "<presence xmlns='jabber:client' from='a@b/c'><show>away</show></presence>";
         let presence = PresenceCaps::from_xml(xml).unwrap();
         assert!(presence.caps().is_none());
     }

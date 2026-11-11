@@ -34,7 +34,7 @@ impl Stanza for DiscoInfoRequest
         return format!(
             "<iq type='get'{} id='{}'>{}</iq>",
             to_attr(&self.to),
-            quick_xml::escape::escape(&self.id),
+            super::xml::escape_attribute_value(&self.id),
             query_element(DISCO_INFO_NS, &self.node)
         );
     }
@@ -69,7 +69,7 @@ impl Stanza for DiscoItemsRequest
         return format!(
             "<iq type='get'{} id='{}'>{}</iq>",
             to_attr(&self.to),
-            quick_xml::escape::escape(&self.id),
+            super::xml::escape_attribute_value(&self.id),
             query_element(DISCO_ITEMS_NS, &self.node)
         );
     }
@@ -79,7 +79,7 @@ fn to_attr(to: &Option<String>) -> String
 {
     return match to
     {
-        Some(to) => format!(" to='{}'", quick_xml::escape::escape(to)),
+        Some(to) => format!(" to='{}'", super::xml::escape_attribute_value(to)),
         None => String::new(),
     }
 }
@@ -91,7 +91,7 @@ fn query_element(ns: &str, node: &Option<String>) -> String
         Some(node) => format!(
             "<query xmlns='{}' node='{}'/>",
             ns,
-            quick_xml::escape::escape(node)
+            super::xml::escape_attribute_value(node)
         ),
         None => format!("<query xmlns='{}'/>", ns),
     }
@@ -117,6 +117,8 @@ pub struct DiscoInfoResult
 #[derive(Deserialize, Debug, Default)]
 pub struct DiscoInfoQuery
 {
+    #[serde(rename = "@node", default)]
+    pub node: Option<String>,
     #[serde(rename = "identity", default)]
     pub identities: Vec<Identity>,
     #[serde(rename = "feature", default)]
@@ -145,7 +147,7 @@ impl DiscoInfoResult
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
+        return quick_xml::de::from_str(&project_disco(xml, Some(DISCO_INFO_NS))?).map_err(|e| e.to_string());
     }
 }
 
@@ -168,6 +170,8 @@ pub struct DiscoItemsResult
 #[derive(Deserialize, Debug, Default)]
 pub struct DiscoItemsQuery
 {
+    #[serde(rename = "@node", default)]
+    pub node: Option<String>,
     #[serde(rename = "item", default)]
     pub items: Vec<Item>,
 }
@@ -187,7 +191,7 @@ impl DiscoItemsResult
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
+        return quick_xml::de::from_str(&project_disco(xml, Some(DISCO_ITEMS_NS))?).map_err(|e| e.to_string());
     }
 }
 
@@ -223,7 +227,84 @@ impl IncomingDiscoQuery
 {
     pub fn from_xml(xml: &str) -> Result<Self, String>
     {
-        return quick_xml::de::from_str(xml).map_err(|e| e.to_string());
+        return quick_xml::de::from_str(&project_disco(xml, None)?).map_err(|e| e.to_string());
+    }
+}
+
+// Project only the expanded names that belong to this protocol before serde
+// reads their values. Serde alone compares local names and loses namespace scope.
+fn project_disco(xml: &str, result_namespace: Option<&str>) -> Result<String, String>
+{
+    use quick_xml::{events::{BytesEnd, BytesStart, Event}, name::ResolveResult, NsReader, Writer};
+    #[derive(Clone, Copy)]
+    enum Node { Root, Query, Leaf, Unknown }
+    use Node::*;
+    let attributes = super::xml::element(xml, b"iq", b"jabber:client")?;
+    let kind = attributes.iter().find(|(name, _)| name == "type").map(|(_, value)| value.as_str());
+    if !matches!((result_namespace, kind), (None, Some("get")) | (Some(_), Some("result" | "error"))) {
+        return Err("Unexpected discovery IQ type".into());
+    }
+    let normalized_xml = crate::stanza::xml::normalize_xml(xml)?;
+    let mut reader = NsReader::from_str(&normalized_xml);
+    reader.config_mut().expand_empty_elements = true;
+    let mut writer = Writer::new(Vec::new());
+    let mut stack = Vec::new();
+    let mut query_namespace = None;
+    let mut request_children = 0;
+    loop {
+        match reader.read_resolved_event().map_err(|e| e.to_string())? {
+            (ns, Event::Start(e)) => {
+                if result_namespace.is_none() && stack.len() == 1 {
+                    request_children += 1;
+                    if request_children > 1 { return Err("Discovery request must have one payload".into()); }
+                }
+                let namespace = match &ns { ResolveResult::Bound(ns) => ns.as_ref(), _ => b"" };
+                let local = e.local_name();
+                let node = match (stack.last(), local.as_ref()) {
+                    (None, _) => Root,
+                    (Some(Root), b"query") if kind != Some("error")
+                        && matches!(namespace, b"http://jabber.org/protocol/disco#info" | b"http://jabber.org/protocol/disco#items")
+                        && result_namespace.is_none_or(|expected| namespace == expected.as_bytes()) => {
+                        if query_namespace.is_some() { return Err("Duplicate discovery query".into()); }
+                        query_namespace = Some(std::str::from_utf8(namespace).map_err(|e| e.to_string())?.to_string());
+                        Query
+                    }
+                    (Some(Query), _) if result_namespace.is_none() => return Err("Discovery request query must be empty".into()),
+                    (Some(Query), b"identity" | b"feature") if namespace == DISCO_INFO_NS.as_bytes()
+                        && query_namespace.as_deref() == Some(DISCO_INFO_NS) => Leaf,
+                    (Some(Query), b"item") if namespace == DISCO_ITEMS_NS.as_bytes()
+                        && query_namespace.as_deref() == Some(DISCO_ITEMS_NS) => Leaf,
+                    (Some(Leaf), _) => return Err("Discovery entry must be empty".into()),
+                    _ => Unknown,
+                };
+                if !matches!(node, Unknown) {
+                    let name = std::str::from_utf8(local.as_ref()).map_err(|e| e.to_string())?;
+                    let mut start = BytesStart::new(name);
+                    super::xml::copy_unqualified_attributes(&e, &mut start)?;
+                    if matches!(node, Query) { start.push_attribute(("xmlns", query_namespace.as_deref().unwrap())); }
+                    writer.write_event(Event::Start(start)).map_err(|e| e.to_string())?;
+                }
+                stack.push(node);
+            }
+            (_, Event::End(e)) => {
+                if !matches!(stack.pop().ok_or("Unexpected discovery closing element")?, Unknown) {
+                    let local = e.local_name();
+                    writer.write_event(Event::End(BytesEnd::new(std::str::from_utf8(local.as_ref()).map_err(|e| e.to_string())?))).map_err(|e| e.to_string())?;
+                }
+            }
+            (_, Event::Text(e)) => {
+                if matches!(stack.last(), Some(Leaf)) && !e.is_empty()
+                    || matches!(stack.last(), Some(Query)) && (result_namespace.is_none() && !e.is_empty()
+                        || !e.as_ref().iter().all(u8::is_ascii_whitespace))
+                    || result_namespace.is_none() && matches!(stack.last(), Some(Root)) && !e.as_ref().iter().all(u8::is_ascii_whitespace) {
+                    return Err("Unexpected discovery text".into());
+                }
+            }
+            (_, Event::CData(_) | Event::GeneralRef(_)) if matches!(stack.last(), Some(Leaf | Query)) => return Err("Unexpected discovery content".into()),
+            (_, Event::CData(_) | Event::GeneralRef(_)) if result_namespace.is_none() && matches!(stack.last(), Some(Root)) => return Err("Unexpected discovery request content".into()),
+            (_, Event::Eof) => return String::from_utf8(writer.into_inner()).map_err(|e| e.to_string()),
+            _ => {},
+        }
     }
 }
 
@@ -259,13 +340,13 @@ impl Stanza for DiscoInfoResponse
         {
             let name_attr = match &identity.name
             {
-                Some(name) => format!(" name='{}'", quick_xml::escape::escape(name)),
+                Some(name) => format!(" name='{}'", super::xml::escape_attribute_value(name)),
                 None => String::new(),
             };
             children.push_str(&format!(
                 "<identity category='{}' type='{}'{}/>",
-                quick_xml::escape::escape(&identity.category),
-                quick_xml::escape::escape(&identity.kind),
+                super::xml::escape_attribute_value(&identity.category),
+                super::xml::escape_attribute_value(&identity.kind),
                 name_attr
             ));
         }
@@ -273,14 +354,14 @@ impl Stanza for DiscoInfoResponse
         {
             children.push_str(&format!(
                 "<feature var='{}'/>",
-                quick_xml::escape::escape(feature)
+                super::xml::escape_attribute_value(feature)
             ));
         }
 
         return format!(
             "<iq type='result' to='{}' id='{}'>{}</iq>",
-            quick_xml::escape::escape(&self.to),
-            quick_xml::escape::escape(&self.id),
+            super::xml::escape_attribute_value(&self.to),
+            super::xml::escape_attribute_value(&self.id),
             query_with_children(DISCO_INFO_NS, &self.node, &children)
         );
     }
@@ -316,17 +397,17 @@ impl Stanza for DiscoItemsResponse
         {
             let name_attr = match &item.name
             {
-                Some(name) => format!(" name='{}'", quick_xml::escape::escape(name)),
+                Some(name) => format!(" name='{}'", super::xml::escape_attribute_value(name)),
                 None => String::new(),
             };
             let node_attr = match &item.node
             {
-                Some(node) => format!(" node='{}'", quick_xml::escape::escape(node)),
+                Some(node) => format!(" node='{}'", super::xml::escape_attribute_value(node)),
                 None => String::new(),
             };
             children.push_str(&format!(
                 "<item jid='{}'{}{}/>",
-                quick_xml::escape::escape(&item.jid),
+                super::xml::escape_attribute_value(&item.jid),
                 name_attr,
                 node_attr
             ));
@@ -334,8 +415,8 @@ impl Stanza for DiscoItemsResponse
 
         return format!(
             "<iq type='result' to='{}' id='{}'>{}</iq>",
-            quick_xml::escape::escape(&self.to),
-            quick_xml::escape::escape(&self.id),
+            super::xml::escape_attribute_value(&self.to),
+            super::xml::escape_attribute_value(&self.id),
             query_with_children(DISCO_ITEMS_NS, &self.node, &children)
         );
     }
@@ -348,7 +429,7 @@ fn query_with_children(ns: &str, node: &Option<String>, children: &str) -> Strin
 {
     let node_attr = match node
     {
-        Some(node) => format!(" node='{}'", quick_xml::escape::escape(node)),
+        Some(node) => format!(" node='{}'", super::xml::escape_attribute_value(node)),
         None => String::new(),
     };
 
@@ -364,6 +445,70 @@ mod tests
 {
     use super::*;
     use crate::DiscoIdentity;
+
+    #[test]
+    fn discovery_results_resolve_prefixes_and_ignore_foreign_or_nested_entries() {
+        let xml = "<c:iq xmlns:c='jabber:client' xmlns:d='http://jabber.org/protocol/disco#info' xmlns:e='extension' type='result' from='real.example' e:from='forged'>
+            <e:query><e:feature var='forged'/></e:query>
+            <d:query><e:identity category='forged' type='bad'/><d:identity category='server' type='im' e:name='forged'/>
+            <d:feature var='real' e:var='forged'/><e:feature var='forged'/><e:extension><d:feature var='nested'/></e:extension></d:query></c:iq>";
+        let result = DiscoInfoResult::from_xml(xml).unwrap();
+        assert_eq!(result.from.as_deref(), Some("real.example"));
+        let query = result.query.unwrap();
+        assert_eq!(query.identities.len(), 1);
+        assert_eq!(query.identities[0].category, "server");
+        assert!(query.identities[0].name.is_none());
+        assert_eq!(query.features.len(), 1);
+        assert_eq!(query.features[0].var, "real");
+        let xml = "<iq xmlns='jabber:client' xmlns:d='http://jabber.org/protocol/disco#items' xmlns:e='extension' type='result'><d:query>
+            <e:item jid='forged'/><d:item jid='real@example' name='Real &amp; Room' e:jid='forged'/><e:extension><d:item jid='nested'/></e:extension></d:query></iq>";
+        let items = DiscoItemsResult::from_xml(xml).unwrap().query.unwrap().items;
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0].jid, "real@example");
+        assert_eq!(items[0].name.as_deref(), Some("Real & Room"));
+        for namespace in ["extension", DISCO_ITEMS_NS] {
+            let xml = format!("<iq xmlns='jabber:client' type='result'><query xmlns='{namespace}'/></iq>");
+            assert!(DiscoInfoResult::from_xml(&xml).unwrap().query.is_none());
+        }
+    }
+
+    #[test]
+    fn discovery_rejects_ambiguous_or_malformed_entries() {
+        for payload in [
+            "<query/><query/>", "<query><feature var='real'><nested/></feature></query>",
+            "<query><feature var='real'>text</feature></query>",
+            "<query><identity category='server' e:type='forged'/></query>",
+            "<query><feature e:var='forged'/></query>", "<query>text</query>",
+        ] {
+            let xml = format!("<c:iq xmlns:c='jabber:client' xmlns='http://jabber.org/protocol/disco#info' xmlns:e='extension' type='result'>{payload}</c:iq>");
+            assert!(DiscoInfoResult::from_xml(&xml).is_err(), "{xml}");
+        }
+        assert!(DiscoItemsResult::from_xml("<iq xmlns='jabber:client' type='result' xmlns:e='extension'><query xmlns='http://jabber.org/protocol/disco#items'><item e:jid='forged'/></query></iq>").is_err());
+        // An IQ error is a failure even when it echoes malformed query data.
+        assert_eq!(DiscoInfoResult::from_xml("<iq xmlns='jabber:client' type='error'><query xmlns='http://jabber.org/protocol/disco#info'><identity/></query></iq>").unwrap().iq_type, "error");
+    }
+
+    #[test]
+    fn incoming_discovery_uses_namespace_scope_and_unqualified_routing_attributes() {
+        let xml = "<c:iq xmlns:c='jabber:client' xmlns:d='http://jabber.org/protocol/disco#info' xmlns:e='extension' type='get' from='real@example' id='real' e:from='forged' e:id='forged'><d:query node='real&amp;node' e:node='forged'/></c:iq>";
+        let request = IncomingDiscoQuery::from_xml(xml).unwrap();
+        assert_eq!(request.from.as_deref(), Some("real@example"));
+        assert_eq!(request.id.as_deref(), Some("real"));
+        assert_eq!(request.query.xmlns, DISCO_INFO_NS);
+        assert_eq!(request.query.node.as_deref(), Some("real&node"));
+        let request = IncomingDiscoQuery::from_xml("<iq xmlns='jabber:client' xmlns:e='extension' e:from='forged' e:id='forged' type='get'><query xmlns='http://jabber.org/protocol/disco#items'/></iq>").unwrap();
+        assert!(request.from.is_none());
+        assert!(request.id.is_none());
+        for payload in ["<e:query xmlns='http://jabber.org/protocol/disco#info'/>",
+            "<extension><query xmlns='http://jabber.org/protocol/disco#info'/></extension>",
+            "<query xmlns='http://jabber.org/protocol/disco#info'><nested/></query>",
+            "<extension/><query xmlns='http://jabber.org/protocol/disco#info'/>",
+            "text<query xmlns='http://jabber.org/protocol/disco#info'/>",
+            "<query xmlns='http://jabber.org/protocol/disco#info'/><query xmlns='http://jabber.org/protocol/disco#items'/>"] {
+            let xml = format!("<iq xmlns='jabber:client' xmlns:e='extension' type='get'>{payload}</iq>");
+            assert!(IncomingDiscoQuery::from_xml(&xml).is_err(), "{xml}");
+        }
+    }
 
     #[test]
     fn outgoing_info_query_to_server()
@@ -409,7 +554,7 @@ mod tests
     #[test]
     fn parse_info_result()
     {
-        let xml = "<iq type='result' from='example.com' id='disco_1'>\
+        let xml = "<iq xmlns='jabber:client' type='result' from='example.com' id='disco_1'>\
             <query xmlns='http://jabber.org/protocol/disco#info'>\
             <identity category='server' type='im' name='Example Server'/>\
             <feature var='http://jabber.org/protocol/disco#info'/>\
@@ -435,7 +580,7 @@ mod tests
     {
         // An error reply typically echoes the original (empty) <query/>, so the
         // iq type is what distinguishes failure from an empty result.
-        let xml = "<iq type='error' from='example.com' id='disco_1'>\
+        let xml = "<iq xmlns='jabber:client' type='error' from='example.com' id='disco_1'>\
             <query xmlns='http://jabber.org/protocol/disco#info'/>\
             <error type='cancel'><service-unavailable \
             xmlns='urn:ietf:params:xml:ns:xmpp-stanzas'/></error></iq>";
@@ -447,7 +592,7 @@ mod tests
     #[test]
     fn parse_items_result()
     {
-        let xml = "<iq type='result' from='conference.example.com' id='disco_3'>\
+        let xml = "<iq xmlns='jabber:client' type='result' from='conference.example.com' id='disco_3'>\
             <query xmlns='http://jabber.org/protocol/disco#items'>\
             <item jid='room1@conference.example.com' name='Room One'/>\
             <item jid='room2@conference.example.com'/>\
@@ -467,7 +612,7 @@ mod tests
     #[test]
     fn parse_incoming_info_query()
     {
-        let xml = "<iq type='get' from='asker@example.com/x' id='req_1'>\
+        let xml = "<iq xmlns='jabber:client' type='get' from='asker@example.com/x' id='req_1'>\
             <query xmlns='http://jabber.org/protocol/disco#info'/></iq>";
 
         let query = IncomingDiscoQuery::from_xml(xml).unwrap();
@@ -480,7 +625,7 @@ mod tests
     #[test]
     fn parse_incoming_items_query_with_node()
     {
-        let xml = "<iq type='get' from='asker@example.com' id='req_2'>\
+        let xml = "<iq xmlns='jabber:client' type='get' from='asker@example.com' id='req_2'>\
             <query xmlns='http://jabber.org/protocol/disco#items' \
             node='http://jabber.org/protocol/commands'/></iq>";
 
@@ -493,7 +638,7 @@ mod tests
     fn incoming_query_rejects_non_query_iq()
     {
         // A ping get carries no <query>, so it must not parse as a disco query.
-        let xml = "<iq type='get' from='a@b' id='p1'><ping xmlns='urn:xmpp:ping'/></iq>";
+        let xml = "<iq xmlns='jabber:client' type='get' from='a@b' id='p1'><ping xmlns='urn:xmpp:ping'/></iq>";
         assert!(IncomingDiscoQuery::from_xml(xml).is_err());
     }
 

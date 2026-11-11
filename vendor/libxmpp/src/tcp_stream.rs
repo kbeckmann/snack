@@ -1,5 +1,6 @@
 use tokio::io::{ AsyncReadExt, AsyncWriteExt, ReadHalf, WriteHalf };
 use tokio::net::TcpStream;
+use tokio_rustls::rustls::pki_types::ServerName;
 use tokio_rustls::rustls::{ ClientConfig, RootCertStore };
 use tokio_rustls::TlsConnector;
 
@@ -22,6 +23,24 @@ pub enum TcpWriter
 {
     Plain(WriteHalf<TcpStream>),
     Tls(WriteHalf<tokio_rustls::client::TlsStream<TcpStream>>),
+}
+
+// Brackets belong to the JID's IPv6 domain representation, not the socket
+// hostname or TLS IP identity. Preserve the original domain for XML routing.
+fn connection_host(server: &str) -> Result<&str, XmppError>
+{
+    if server.contains(['[', ']']) {
+        let address = server.strip_prefix('[').and_then(|value| value.strip_suffix(']'))
+            .filter(|value| value.parse::<std::net::Ipv6Addr>().is_ok())
+            .ok_or_else(|| XmppError::InvalidServerName("Expected a bracketed IPv6 address.".into()))?;
+        Ok(address)
+    } else { Ok(server) }
+}
+
+fn tls_server_name(server: &str) -> Result<ServerName<'static>, XmppError>
+{
+    ServerName::try_from(connection_host(server)?.to_string())
+        .map_err(|error| XmppError::InvalidServerName(format!("{server}: {error}")))
 }
 
 impl Tcp
@@ -52,8 +71,7 @@ impl Tcp
                     .with_no_client_auth();
 
                 let connector = TlsConnector::from(std::sync::Arc::new(config));
-                let server_name = tokio_rustls::rustls::pki_types::ServerName::try_from(domain.clone())
-                    .map_err(|e| XmppError::InvalidServerName(format!("{}: {}", domain, e)))?;
+                let server_name = tls_server_name(&domain)?;
                 let tls_stream = connector.connect(server_name, stream).await
                     .map_err(|e| XmppError::Tls(e.to_string()))?;
 
@@ -69,8 +87,7 @@ impl Tcp
         {
             Self::Disconnected =>
             {
-                let addr = format!("{}:{}", server, port);
-                let stream = TcpStream::connect(&addr).await?;
+                let stream = TcpStream::connect((connection_host(&server)?, port)).await?;
 
                 return Ok(Self::Connected(stream, server));
             }
@@ -205,5 +222,32 @@ impl TcpWriter
                 let _ = writer.shutdown().await;
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn transport_and_tls_use_ip_literals_without_changing_jid_representation() {
+        for domain in ["[::1]", "[2001:db8::1]", "[::ffff:192.0.2.1]"] {
+            assert!(matches!(super::tls_server_name(domain).unwrap(), tokio_rustls::rustls::pki_types::ServerName::IpAddress(_)));
+            assert_eq!(super::connection_host(domain).unwrap(), &domain[1..domain.len() - 1]);
+        }
+        assert!(matches!(super::tls_server_name("127.0.0.1").unwrap(), tokio_rustls::rustls::pki_types::ServerName::IpAddress(_)));
+        assert!(matches!(super::tls_server_name("example.com").unwrap(), tokio_rustls::rustls::pki_types::ServerName::DnsName(_)));
+        for domain in ["[example.com]", "[::1]:5222", "[::1", "::1]", "[]"] {
+            assert!(super::connection_host(domain).is_err(), "{domain}");
+        }
+    }
+
+    #[tokio::test]
+    async fn bracketed_ipv6_reaches_tls_negotiation_instead_of_failing_name_conversion() {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv6Addr::LOCALHOST, 0)).await.unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let tcp = super::Tcp::new().connect("[::1]".into(), port).await.unwrap();
+        let (peer, _) = listener.accept().await.unwrap();
+        drop(peer);
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2), tcp.add_tls()).await.unwrap();
+        assert!(matches!(result, Err(crate::XmppError::Tls(_))), "a valid IP identity must reach the TLS handshake");
     }
 }

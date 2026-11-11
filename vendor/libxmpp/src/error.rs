@@ -10,6 +10,9 @@ pub enum XmppError
     Io(std::io::Error),
     /// The supplied JID could not be parsed (e.g. it has no `@`).
     InvalidJid(String),
+    /// Locally supplied outgoing data cannot be represented on the stream.
+    /// Retrying the same input or reconnecting will not fix it.
+    InvalidInput(String),
     /// The server's hostname is not a valid TLS server name.
     InvalidServerName(String),
     /// STARTTLS negotiation failed or was refused by the server.
@@ -23,6 +26,9 @@ pub enum XmppError
     NoSaslMechanism,
     /// Resource binding failed after authentication.
     Bind(String),
+    /// The server ended the XML stream with a fatal stream-level error.
+    /// This is distinct from a failed authentication exchange.
+    Stream(String),
     /// A stream element or stanza could not be parsed.
     Parse(String),
     /// The peer violated the expected protocol flow or connection state.
@@ -42,12 +48,14 @@ impl std::fmt::Display for XmppError
         {
             XmppError::Io(e) => write!(f, "I/O error: {}", e),
             XmppError::InvalidJid(s) => write!(f, "invalid JID: {}", s),
+            XmppError::InvalidInput(s) => write!(f, "{}", s),
             XmppError::InvalidServerName(s) => write!(f, "invalid server name: {}", s),
             XmppError::Tls(s) => write!(f, "TLS error: {}", s),
             XmppError::TlsRequired => write!(f, "server does not offer required TLS encryption"),
             XmppError::Auth(s) => write!(f, "authentication failed: {}", s),
             XmppError::NoSaslMechanism => write!(f, "no supported SASL mechanism offered by server"),
             XmppError::Bind(s) => write!(f, "resource binding failed: {}", s),
+            XmppError::Stream(s) => write!(f, "server stream error: {}", s),
             XmppError::Parse(s) => write!(f, "parse error: {}", s),
             XmppError::Protocol(s) => write!(f, "protocol error: {}", s),
             XmppError::Timeout(s) => write!(f, "timed out: {}", s),

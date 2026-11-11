@@ -61,6 +61,9 @@ version = "0.11.0"
 [dependencies.sha2]
 version = "0.11.0"
 
+[dependencies.stringprep]
+version = "0.1.5"
+
 [dependencies.tokio]
 version = "1.52.2"
 features = [
