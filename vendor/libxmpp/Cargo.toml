@@ -83,6 +83,12 @@ features = [
 
 [dependencies.tokio-rustls]
 version = "0.26.4"
+default-features = false
+features = [
+    "logging",
+    "ring",
+    "tls12",
+]
 
 [dependencies.webpki-roots]
 version = "1.0.7"
