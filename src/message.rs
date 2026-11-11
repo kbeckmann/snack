@@ -28,6 +28,8 @@ pub enum TranscriptAction {
 pub enum SidebarAction {
     SelectRoom(String),
     SelectChat(String),
+    ReopenChat(String),
+    ToggleEarlierChats,
     Disconnect,
     ForgetAutoLogin,
     ForceReconnect,
@@ -124,6 +126,9 @@ pub enum Message
     ScopedSidebar { channel: Option<xmpp::CommandChannel>, profile: Option<String>, action: SidebarAction },
     SelectRoom(String),
     SelectChat(String),
+    // Reopen a closed direct conversation from the sidebar's Earlier list.
+    ReopenChat(String),
+    ToggleEarlierChats,
     StartChat(String),
     OpenMemberChat { context: uuid::Uuid, nick: String, jid: String },
     ScopedComposer { context: uuid::Uuid, action: ComposerAction },

@@ -1463,6 +1463,110 @@ fn macos_control_letters_are_editing_keys_not_app_shortcuts() {
     }
 }
 
+fn direct_chat_state() -> Snack {
+    let mut s = Snack::test_state();
+    s.state = AppState::Connected;
+    s.connected_jid = Some("me@example/device".into());
+    s.history = Some(History::open_in_memory());
+    s
+}
+
+fn chat_bodies(s: &Snack, jid: &str) -> Vec<String> {
+    let chat = s.chats.iter().find(|chat| chat.jid == jid).expect("open chat");
+    chat.messages.iter().filter_map(|message| match message {
+        room::message::Message::Chat { body, .. } => Some(body.clone()), _ => None,
+    }).collect()
+}
+
+#[test]
+fn closed_direct_chats_stay_listed_and_reopen_with_their_history() {
+    let mut s = direct_chat_state();
+    let _ = s.update(Message::StartChat("bob@example".into()));
+    assert!(s.earlier_chats.is_empty());
+    s.history.as_ref().unwrap().store("bob@example", "bob", "old message", chrono::Utc::now(), false, None).unwrap();
+
+    let _ = s.update(Message::CloseChat);
+    assert!(s.chats.is_empty());
+    assert_eq!(s.earlier_chats.iter().map(|chat| chat.conversation.as_str()).collect::<Vec<_>>(), ["bob@example"]);
+    assert!(!s.show_earlier_chats, "the Earlier list starts collapsed");
+    let _ = s.update(Message::ToggleEarlierChats);
+    assert!(s.show_earlier_chats);
+
+    let _ = s.update(Message::ReopenChat("bob@example".into()));
+    assert_eq!(s.active, Some(Selection::Chat(0)));
+    assert!(s.earlier_chats.is_empty());
+    assert_eq!(chat_bodies(&s, "bob@example"), ["old message"]);
+
+    // A message from a closed contact reopens the conversation.
+    let _ = s.update(Message::CloseChat);
+    let _ = s.update(Message::XmppEvent(xmpp::XmppEvent::DirectMessage {
+        from: "bob@example/phone".into(), body: "are you there".into(), timestamp: chrono::Utc::now(),
+        delayed: false, stanza_id: None, origin_id: None }));
+    assert!(s.chats.iter().any(|chat| chat.jid == "bob@example"));
+    assert!(s.earlier_chats.is_empty());
+    assert!(s.history.as_ref().unwrap().direct_chats().unwrap()[0].open);
+
+    // Only listed conversations can be reopened from the sidebar.
+    let _ = s.update(Message::ReopenChat("stranger@example".into()));
+    assert!(!s.chats.iter().any(|chat| chat.jid == "stranger@example"));
+}
+
+#[test]
+fn reopened_private_room_chats_keep_their_occupant_key() {
+    let mut s = direct_chat_state();
+    let key = "room@conference.example/nick";
+    s.history.as_ref().unwrap().record_direct_chat(key, "nick", false).unwrap();
+    s.refresh_earlier_chats();
+    let _ = s.update(Message::ReopenChat(key.into()));
+    assert_eq!(s.chats.iter().map(|chat| chat.jid.as_str()).collect::<Vec<_>>(), [key]);
+    assert_eq!(s.chats[0].title, "nick");
+}
+
+#[test]
+fn login_restores_open_direct_chats_and_lists_closed_ones() {
+    let mut s = direct_chat_state();
+    {
+        let h = s.history.as_ref().unwrap();
+        h.record_direct_chat("bob@example", "bob", true).unwrap();
+        h.record_direct_chat("carol@example", "carol", false).unwrap();
+        h.store("dave@example", "dave", "from before the list existed", chrono::Utc::now(), false, None).unwrap();
+    }
+    s.restore_direct_chats("me@example");
+    assert_eq!(s.chats.iter().map(|chat| chat.jid.as_str()).collect::<Vec<_>>(), ["bob@example"]);
+    let mut earlier: Vec<_> = s.earlier_chats.iter().map(|chat| chat.conversation.as_str()).collect();
+    earlier.sort_unstable();
+    assert_eq!(earlier, ["carol@example", "dave@example"]);
+    assert!(s.active.is_none(), "restoring does not switch conversations");
+}
+
+#[test]
+fn sidebar_shows_closed_chats_only_under_the_expanded_earlier_list() {
+    use iced::advanced::widget::Operation;
+    struct Texts(Vec<String>);
+    impl Operation for Texts {
+        fn traverse(&mut self, operate: &mut dyn FnMut(&mut dyn Operation)) { operate(self); }
+        fn text(&mut self, _id: Option<&iced::widget::Id>, _bounds: iced::Rectangle, text: &str) { self.0.push(text.to_string()); }
+    }
+    let texts = |s: &Snack| {
+        let mut widget = crate::ui::sidebar::view(s);
+        let mut tree = Tree::new(&widget);
+        let r = renderer();
+        let size = iced::Size::new(200.0, 600.0);
+        let node = widget.as_widget_mut().layout(&mut tree, &r, &layout::Limits::new(size, size));
+        let mut texts = Texts(Vec::new());
+        widget.as_widget_mut().operate(&mut tree, Layout::new(&node), &r, &mut texts);
+        texts.0
+    };
+    let mut s = direct_chat_state();
+    let _ = s.update(Message::StartChat("bob@example".into()));
+    let _ = s.update(Message::CloseChat);
+    let collapsed = texts(&s);
+    assert!(collapsed.iter().any(|text| text.ends_with("Earlier (1)")), "{collapsed:?}");
+    assert!(!collapsed.iter().any(|text| text == "bob"));
+    let _ = s.update(Message::ToggleEarlierChats);
+    assert!(texts(&s).iter().any(|text| text == "bob"));
+}
+
 // Click a message body to focus it, then send keys to the focused body.
 fn transcript_body_keys(s: &Snack, keys: Vec<iced::Event>) -> Vec<Message> {
     use iced::advanced::widget::operation::{Operation, Focusable};

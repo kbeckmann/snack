@@ -250,6 +250,10 @@ pub struct Snack
     // A press on a URL in a message body (row id, URL); it opens on release
     // unless the press turned into a text selection.
     pub(crate) link_press: Option<(i64, String)>,
+    // Closed direct conversations, most recent first, and whether the
+    // sidebar's Earlier list is expanded.
+    pub(crate) earlier_chats: Vec<crate::storage::history::DirectChat>,
+    pub(crate) show_earlier_chats: bool,
     pub(crate) show_join_panel: bool,
     pub(crate) joining_room: Option<String>,
     pub(crate) join_error: Option<String>,
@@ -408,6 +412,8 @@ impl Snack
             draft_histories: Default::default(),
             body_drag: None,
             link_press: None,
+            earlier_chats: Vec::new(),
+            show_earlier_chats: false,
             show_join_panel: false,
             joining_room: None,
             join_error: None,
@@ -487,6 +493,8 @@ impl Snack
             draft_histories: Default::default(),
             body_drag: None,
             link_press: None,
+            earlier_chats: Vec::new(),
+            show_earlier_chats: false,
             show_join_panel: false,
             joining_room: None,
             join_error: None,

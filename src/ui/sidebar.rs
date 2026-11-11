@@ -189,10 +189,44 @@ pub fn view(state: &Snack) -> Element<'_, Message>
         chat_items.push(super::identity::instance(item.into(), ("chat-entry", c.jid.clone())));
     }
 
+    // Closed direct conversations stay reachable under a collapsed Earlier
+    // list, most recently active first, so closing never loses a contact.
+    if !state.earlier_chats.is_empty()
+    {
+        let arrow = if state.show_earlier_chats { "\u{25BE}" } else { "\u{25B8}" };
+        let toggle = button(text(format!("{arrow} Earlier ({})", state.earlier_chats.len())).size(12)
+                .color(iced::Color::from_rgb(0.55, 0.59, 0.65)))
+            .on_press(Message::ToggleEarlierChats)
+            .width(Fill)
+            .padding([4, 6])
+            .style(button::text);
+        chat_items.push(super::identity::instance(toggle.into(), ("earlier-chats", String::new())));
+        if state.show_earlier_chats
+        {
+            for chat in &state.earlier_chats
+            {
+                let when = chat.last_activity.map(|at| at.with_timezone(&chrono::Local).format("%Y-%m-%d").to_string())
+                    .unwrap_or_default();
+                let label = row![
+                    text(" ").size(14),
+                    text(&chat.title).size(14).color(iced::Color::from_rgb(0.62, 0.65, 0.70)).width(Fill),
+                    text(when).size(11).color(iced::Color::from_rgb(0.45, 0.48, 0.54)),
+                ].spacing(6).align_y(iced::Alignment::Center);
+                let item = button(label)
+                    .on_press(Message::ReopenChat(chat.conversation.clone()))
+                    .width(Fill)
+                    .padding(6)
+                    .style(button::text);
+                let item = iced::widget::tooltip(item, text(&chat.conversation).size(12), iced::widget::tooltip::Position::Right);
+                chat_items.push(super::identity::instance(item.into(), ("earlier-chat", chat.conversation.clone())));
+            }
+        }
+    }
+
     let chats_list = scrollable(
         column(chat_items).spacing(2).width(Fill)
     ).id("sidebar-chats")
-        .height(if state.chats.is_empty() { Length::Shrink } else { Fill });
+        .height(if state.chats.is_empty() && state.earlier_chats.is_empty() { Length::Shrink } else { Fill });
 
     let content: Element<'_, Message> = container(
         column![account_row, sidebar_header, list, chats_header, chats_list].spacing(8).width(Fill)
@@ -210,6 +244,8 @@ pub fn view(state: &Snack) -> Element<'_, Message>
         let action = match message {
             Message::SelectRoom(jid) => SidebarAction::SelectRoom(jid),
             Message::SelectChat(jid) => SidebarAction::SelectChat(jid),
+            Message::ReopenChat(jid) => SidebarAction::ReopenChat(jid),
+            Message::ToggleEarlierChats => SidebarAction::ToggleEarlierChats,
             Message::Disconnect => SidebarAction::Disconnect,
             Message::ForgetAutoLogin => SidebarAction::ForgetAutoLogin,
             Message::ForceReconnect => SidebarAction::ForceReconnect,

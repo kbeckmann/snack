@@ -59,6 +59,8 @@ other Cocoa text fields.
 
 Snack runs one instance per configuration directory. Launching it again restores and focuses the existing window before any second login or storage access. An operating-system lock protects the shared outbox and drafts and is released automatically after exit or a crash.
 
+Open direct conversations are restored after a restart. Closing one removes it from the sidebar without losing it: closed conversations are listed, most recent first, under a collapsed **Earlier** section in the Chats list, and clicking one reopens it with its history. A new message from a closed contact reopens the conversation. History from before this list existed is scanned once to fill it.
+
 History lives in SQLite under the platform application-data directory. Drafts are saved in the platform configuration directory and flushed when switching conversations or closing the window. Existing history databases are migrated without changing message IDs; account ownership prevents another login from replaying the wrong outgoing queue. Retained history writes are retried in their owning account databases after switching accounts or disconnecting.
 
 If saving settings or message updates fails when closing, Snack keeps the window open with retry controls. **Close without saving** is available after a failed close attempt; it can discard updates that have not reached disk. Durably queued messages can be retried after the next launch.

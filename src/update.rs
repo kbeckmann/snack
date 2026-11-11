@@ -1184,6 +1184,72 @@ impl Snack
         } else { Some(bare.to_string()) }
     }
 
+    // Add a direct conversation to the sidebar, seeded from history, and
+    // remember it as open so it is restored after a restart.
+    fn push_direct_chat(&mut self, peer: String) -> usize
+    {
+        let title = storage::history::direct_chat_title(&peer);
+        if let Some(history) = &self.history {
+            if let Err(error) = history.record_direct_chat(&peer, &title, true) {
+                warn!("Could not record direct conversation: {error}");
+            }
+        }
+        let conv = peer.clone();
+        self.chats.push(room::chat::Chat
+        {
+            jid: peer,
+            title,
+            messages: Vec::new(),
+            parked_messages: Vec::new(),
+            unread: false,
+            read_marker: None,
+            read_boundary: None,
+            oldest_loaded_id: None, local_cursor: None,
+            has_older: false,
+            at_live_tail: true,
+            anchored_bottom: true,
+            mam_in_flight: false,
+            mam_exhausted: false,
+            mam_cursor: None,
+        });
+        let i = self.chats.len() - 1;
+        seed_tail_for(&self.history, &conv, &mut self.chats[i]);
+        self.refresh_earlier_chats();
+        i
+    }
+
+    // Closed direct conversations for the sidebar's Earlier list.
+    fn refresh_earlier_chats(&mut self)
+    {
+        let Some(history) = &self.history else { self.earlier_chats.clear(); return; };
+        match history.direct_chats() {
+            Ok(chats) => {
+                self.earlier_chats = chats.into_iter()
+                    .filter(|chat| !self.chats.iter().any(|open| ::xmpp::jid_matches(&open.jid, &chat.conversation)))
+                    .collect();
+            }
+            Err(error) => warn!("Could not list direct conversations: {error}"),
+        }
+    }
+
+    // After login, list existing direct conversations and reopen the ones
+    // that were open when Snack last ran.
+    fn restore_direct_chats(&mut self, account: &str)
+    {
+        let Some(history) = &self.history else { return; };
+        let own_name = account.split('@').next().unwrap_or(account);
+        let rooms: std::collections::HashSet<String> = self.saved_config.rooms.iter().cloned().collect();
+        if let Err(error) = history.backfill_direct_chats(own_name, &rooms) {
+            warn!("Could not list earlier direct conversations: {error}");
+        }
+        let open: Vec<String> = history.direct_chats().unwrap_or_default().into_iter()
+            .filter(|chat| chat.open).map(|chat| chat.conversation).collect();
+        for peer in open {
+            if self.direct_chat_index(&peer).is_none() { self.push_direct_chat(peer); }
+        }
+        self.refresh_earlier_chats();
+    }
+
     // Prefer an exact stored key when older sessions created equivalent aliases.
     fn direct_chat_index(&self, peer: &str) -> Option<usize>
     {
@@ -2466,6 +2532,7 @@ impl Snack
                 }
                 self.persist_settings();
                 self.history = storage::open_history(&account, self.saved_config.jid.as_deref());
+                self.restore_direct_chats(&account);
                 self.connected_jid = Some(jid.clone());
                 self.bound_jid = None;
                 self.connect_error = None;
@@ -2748,6 +2815,7 @@ impl Snack
                         self.cancel_room_operations();
                         self.room_connections.clear();
                         self.chats.clear();
+                        self.earlier_chats.clear();
                         self.active = None;
                         self.message_input = text_editor::Content::new();
                         self.input_history = Default::default();
@@ -3219,35 +3287,7 @@ impl Snack
                         // earlier stanza claimed this address was a private room.
                         let peer = if own_sender { from.split('/').next().unwrap_or(&from).to_string() }
                             else { let Some(peer) = self.direct_peer_key(&from, private_room) else { return Task::none(); }; peer };
-                        let idx = match self.direct_chat_index(&peer)
-                        {
-                            Some(i) => i,
-                            None =>
-                            {
-                                let title = peer.split_once('/').map(|(_, nick)| nick).unwrap_or_else(|| peer.split('@').next().unwrap_or(&peer)).to_string();
-                                let conv = peer.clone();
-                                self.chats.push(room::chat::Chat
-                                {
-                                    jid: peer,
-                                    title,
-                                    messages: Vec::new(),
-                                    parked_messages: Vec::new(),
-                                    unread: false,
-                                    read_marker: None,
-                                    read_boundary: None,
-                                    oldest_loaded_id: None, local_cursor: None,
-                                    has_older: false,
-                                    at_live_tail: true,
-                                    anchored_bottom: true,
-                                    mam_in_flight: false,
-                                    mam_exhausted: false,
-                                    mam_cursor: None,
-                                });
-                                let i = self.chats.len() - 1;
-                                seed_tail_for(&self.history, &conv, &mut self.chats[i]);
-                                i
-                            }
-                        };
+                        let idx = match self.direct_chat_index(&peer) { Some(i) => i, None => self.push_direct_chat(peer) };
 
                         let conv = self.chats[idx].jid.clone();
                         let self_chat = own_sender && self.own_jid().is_some_and(|own|
@@ -3570,6 +3610,7 @@ impl Snack
                 self.cancel_room_operations();
                 self.room_connections.clear();
                 self.chats.clear();
+                self.earlier_chats.clear();
                 self.mam_pending.clear();
                 self.mam_catchup.clear();
                 self.mam_caught_up.clear();
@@ -3666,6 +3707,8 @@ impl Snack
                 return self.update_inner(match action {
                     SidebarAction::SelectRoom(jid) => Message::SelectRoom(jid),
                     SidebarAction::SelectChat(jid) => Message::SelectChat(jid),
+                    SidebarAction::ReopenChat(jid) => Message::ReopenChat(jid),
+                    SidebarAction::ToggleEarlierChats => Message::ToggleEarlierChats,
                     SidebarAction::Disconnect => Message::Disconnect,
                     SidebarAction::ForgetAutoLogin => Message::ForgetAutoLogin,
                     SidebarAction::ForceReconnect => Message::ForceReconnect,
@@ -3764,6 +3807,16 @@ impl Snack
                 }
                 return self.update_inner(Message::StartChat(jid));
             }
+            Message::ToggleEarlierChats => { self.show_earlier_chats = !self.show_earlier_chats; }
+            Message::ReopenChat(jid) =>
+            {
+                // Reopen the stored conversation key as is: a private room
+                // chat must not become the bare room after leaving the room.
+                if !self.earlier_chats.iter().any(|chat| chat.conversation == jid)
+                    || ::xmpp::validate_message(&jid, "").is_err() { return Task::none(); }
+                let idx = match self.direct_chat_index(&jid) { Some(i) => i, None => self.push_direct_chat(jid) };
+                return self.update_inner(Message::SelectChat(self.chats[idx].jid.clone()));
+            }
             Message::StartChat(jid) =>
             {
                 if let Err(error) = ::xmpp::validate_message(&jid, "") {
@@ -3771,35 +3824,7 @@ impl Snack
                     return Task::none();
                 }
                 let Some(peer) = self.direct_peer_key(&jid, false) else { return Task::none(); };
-                let idx = match self.direct_chat_index(&peer)
-                {
-                    Some(i) => i,
-                    None =>
-                    {
-                        let title = peer.split_once('/').map(|(_, nick)| nick).unwrap_or_else(|| peer.split('@').next().unwrap_or(&peer)).to_string();
-                        let conv = peer.clone();
-                        self.chats.push(room::chat::Chat
-                        {
-                            jid: peer,
-                            title,
-                            messages: Vec::new(),
-                            parked_messages: Vec::new(),
-                            unread: false,
-                            read_marker: None,
-                            read_boundary: None,
-                            oldest_loaded_id: None, local_cursor: None,
-                            has_older: false,
-                            at_live_tail: true,
-                            anchored_bottom: true,
-                            mam_in_flight: false,
-                            mam_exhausted: false,
-                            mam_cursor: None,
-                        });
-                        let i = self.chats.len() - 1;
-                        seed_tail_for(&self.history, &conv, &mut self.chats[i]);
-                        i
-                    }
-                };
+                let idx = match self.direct_chat_index(&peer) { Some(i) => i, None => self.push_direct_chat(peer) };
 
                 // Activate during this accepted action; a deferred SelectChat
                 // could otherwise switch a later account or conversation.
@@ -4258,7 +4283,15 @@ impl Snack
                 if let Some(Selection::Chat(index)) = self.active
                 {
                     let chat_jid = self.chats[index].jid.clone();
+                    let title = self.chats[index].title.clone();
                     self.chats.remove(index);
+                    // Closing hides the conversation; it stays under Earlier.
+                    if let Some(history) = &self.history {
+                        if let Err(error) = history.record_direct_chat(&chat_jid, &title, false) {
+                            warn!("Could not record closed direct conversation: {error}");
+                        }
+                    }
+                    self.refresh_earlier_chats();
                     self.saved_config.drafts.remove(&chat_jid);
                     self.draft_histories.remove(&chat_jid);
                     // The removed index may now name another chat. Clear it

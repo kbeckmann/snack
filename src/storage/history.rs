@@ -113,6 +113,23 @@ impl OutboxItem
     }
 }
 
+#[derive(Debug, Clone, PartialEq)]
+pub struct DirectChat
+{
+    pub conversation: String,
+    pub title: String,
+    pub open: bool,
+    pub last_activity: Option<DateTime<Utc>>,
+}
+
+// The sidebar title of a direct conversation: the occupant nickname of a
+// private room chat, or the contact's local part.
+pub fn direct_chat_title(conversation: &str) -> String
+{
+    conversation.split_once('/').map(|(_, nick)| nick)
+        .unwrap_or_else(|| conversation.split('@').next().unwrap_or(conversation)).to_string()
+}
+
 fn to_dt(ms: i64, column: usize) -> rusqlite::Result<DateTime<Utc>>
 {
     return Utc.timestamp_millis_opt(ms).single()
@@ -383,7 +400,62 @@ impl History
         }
         tx.commit()?;
 
+        // Direct conversations the sidebar can list, including closed ones.
+        conn.execute_batch("CREATE TABLE IF NOT EXISTS direct_chats (
+            conversation TEXT PRIMARY KEY NOT NULL, title TEXT NOT NULL, open INTEGER NOT NULL DEFAULT 1);")?;
+
         return Ok(());
+    }
+
+    // Remember a direct conversation and whether it is open in the sidebar.
+    pub fn record_direct_chat(&self, conversation: &str, title: &str, open: bool) -> rusqlite::Result<()>
+    {
+        self.conn.execute("INSERT INTO direct_chats (conversation, title, open) VALUES (?1, ?2, ?3)
+            ON CONFLICT(conversation) DO UPDATE SET title = excluded.title, open = excluded.open",
+            params![conversation, title, open as i64])?;
+        Ok(())
+    }
+
+    // Known direct conversations, most recently active first.
+    pub fn direct_chats(&self) -> rusqlite::Result<Vec<DirectChat>>
+    {
+        let mut stmt = self.conn.prepare("SELECT d.conversation, d.title, d.open,
+                (SELECT max(m.ts) FROM messages m WHERE m.conversation = d.conversation) AS last
+            FROM direct_chats d ORDER BY last IS NULL, last DESC, d.conversation")?;
+        let rows = stmt.query_map([], |row| Ok(DirectChat {
+            conversation: row.get(0)?, title: row.get(1)?, open: row.get::<_, i64>(2)? != 0,
+            last_activity: row.get::<_, Option<i64>>(3)?.map(|ms| to_dt(ms, 3)).transpose()?,
+        }))?;
+        rows.collect()
+    }
+
+    // Databases from before direct_chats existed: list their direct
+    // conversations once, as closed. A conversation is direct when it is a
+    // private room-occupant chat (room/nick), or when every message in it was
+    // sent by its peer or by this account. Saved rooms are never direct.
+    pub fn backfill_direct_chats(&self, own_name: &str, rooms: &std::collections::HashSet<String>) -> rusqlite::Result<()>
+    {
+        self.conn.execute_batch("CREATE TABLE IF NOT EXISTS metadata (key TEXT PRIMARY KEY, value TEXT NOT NULL)")?;
+        let done: bool = self.conn.query_row("SELECT EXISTS(SELECT 1 FROM metadata WHERE key = 'direct_chats_backfilled')", [], |row| row.get(0))?;
+        if done { return Ok(()); }
+        let mut senders: std::collections::BTreeMap<String, std::collections::HashSet<String>> = Default::default();
+        let mut stmt = self.conn.prepare("SELECT DISTINCT conversation, sender FROM messages")?;
+        for row in stmt.query_map([], |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)))? {
+            let (conversation, sender) = row?;
+            senders.entry(conversation).or_default().insert(sender.to_lowercase());
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for (conversation, senders) in senders {
+            if rooms.iter().any(|room| ::xmpp::jid_matches(room, &conversation)) { continue; }
+            let title = direct_chat_title(&conversation);
+            let private = conversation.contains('/');
+            let peer = title.to_lowercase();
+            if private || senders.iter().all(|sender| *sender == peer || sender.eq_ignore_ascii_case(own_name)) {
+                tx.execute("INSERT OR IGNORE INTO direct_chats (conversation, title, open) VALUES (?1, ?2, 0)", params![conversation, title])?;
+            }
+        }
+        tx.execute("INSERT OR REPLACE INTO metadata (key, value) VALUES ('direct_chats_backfilled', '1')", [])?;
+        tx.commit()
     }
 
     // A legacy database is claimed once; another account must use its own DB.
@@ -1204,6 +1276,42 @@ mod tests
         assert_eq!(h.load_tail("alice", 10).unwrap().len(), 3);
         drop(h);
         std::fs::remove_dir_all(directory).unwrap();
+    }
+
+    #[test]
+    fn direct_chats_keep_open_state_order_by_activity_and_backfill_only_once()
+    {
+        let h = History::open_in_memory();
+        for (conversation, sender, secs) in [
+            ("alice@example", "alice", 10), ("alice@example", "me", 20),
+            ("room@conference.example", "bob", 30), ("room@conference.example", "carol", 31),
+            ("room@conference.example/bob", "bob", 5),
+            // A saved room whose only sender matches its local part is still a room.
+            ("saved@conference.example", "saved", 40),
+        ] {
+            h.store(conversation, sender, "text", at(secs), false, None).unwrap();
+        }
+        let rooms = std::collections::HashSet::from(["saved@conference.example".to_string()]);
+        h.backfill_direct_chats("me", &rooms).unwrap();
+        let listed = |h: &History| h.direct_chats().unwrap().into_iter()
+            .map(|chat| (chat.conversation, chat.title, chat.open)).collect::<Vec<_>>();
+        assert_eq!(listed(&h), [
+            ("alice@example".to_string(), "alice".to_string(), false),
+            ("room@conference.example/bob".to_string(), "bob".to_string(), false),
+        ]);
+        assert_eq!(h.direct_chats().unwrap()[0].last_activity, Some(at(20)));
+
+        // Backfill runs once; later conversations are recorded as they open.
+        h.store("zed@example", "zed", "text", at(50), false, None).unwrap();
+        h.backfill_direct_chats("me", &rooms).unwrap();
+        assert!(!listed(&h).iter().any(|(conversation, ..)| conversation == "zed@example"));
+        h.record_direct_chat("alice@example", "alice", true).unwrap();
+        h.record_direct_chat("new@example", "new", true).unwrap();
+        let chats = listed(&h);
+        assert_eq!(chats[0], ("alice@example".to_string(), "alice".to_string(), true));
+        assert_eq!(chats.last().unwrap().0, "new@example", "conversations without messages sort last");
+        h.record_direct_chat("alice@example", "alice", false).unwrap();
+        assert!(!listed(&h)[0].2);
     }
 
     #[test]
