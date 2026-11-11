@@ -6,20 +6,24 @@ use crate::ui::style;
 
 pub fn view(state: &Snack) -> Element<'_, Message>
 {
-    let account_label = if let Some(ref jid) = state.connected_jid
+    let account_label = if let Some(jid) = state.own_jid()
     {
-        text(jid.clone()).size(12)
+        text(jid).size(12)
     }
     else
     {
         text("Not connected").size(12)
     };
 
+    let account_label = container(scrollable(account_label.wrapping(iced::widget::text::Wrapping::Glyph))
+        .height(Length::Shrink)).max_height(48.0).width(Fill);
+
     let disconnect_btn = button(text("Disconnect").size(11))
         .on_press(Message::Disconnect)
         .padding(4)
         .style(button::text);
 
+    let disconnect_btn = super::identity::instance(disconnect_btn.into(), "account-disconnect");
     let mut action_row = row![disconnect_btn, text("").width(Fill)];
 
     if state.saved_config.jid.is_some()
@@ -28,6 +32,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
             .on_press(Message::ForgetAutoLogin)
             .padding(4)
             .style(button::text);
+        let forget_btn = super::identity::instance(forget_btn.into(), "account-forget");
         action_row = action_row.push(forget_btn);
     }
 
@@ -42,6 +47,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
             .padding(4)
             .style(button::text);
 
+        let retry_btn = super::identity::instance(retry_btn.into(), "account-reconnect");
         account_row = account_row.push(
             row![
                 text("Reconnecting…").size(11),
@@ -52,6 +58,10 @@ pub fn view(state: &Snack) -> Element<'_, Message>
     }
 
     account_row = account_row.push(action_row);
+    if let Some(notice) = super::credential_notice(state) {
+        account_row = account_row.push(container(scrollable(notice)
+            .id("sidebar-credential-notice").height(Length::Shrink)).max_height(96.0).width(Fill));
+    }
 
     let sidebar_header = row![
         text("Rooms").size(14),
@@ -113,18 +123,38 @@ pub fn view(state: &Snack) -> Element<'_, Message>
             let btn_style = if is_active { style::room_button_active } else { button::text };
 
             let item = button(label)
-                .on_press(Message::SelectRoom(i))
+                .on_press(Message::SelectRoom(r.jid.clone()))
                 .width(Fill)
                 .padding(6)
                 .style(btn_style);
 
-            items.push(item.into());
+            items.push(super::identity::instance(item.into(), ("room-entry", r.jid.clone())));
         }
+    }
+
+    let unopened = state.unopened_room_jids();
+    for jid in &unopened {
+        let status = match state.room_connections.get(*jid) {
+            Some(crate::app::RoomConnection::Failed(_)) => "Could not join",
+            _ if state.reconnecting => "Reconnecting…",
+            Some(crate::app::RoomConnection::Joining) => "Joining…",
+            _ => "Waiting for connection…",
+        };
+        let mut entry = column![text(*jid).size(13).wrapping(iced::widget::text::Wrapping::Glyph), text(status).size(11)].spacing(4).width(Fill);
+        if matches!(state.room_connections.get(*jid), Some(crate::app::RoomConnection::Failed(_))) {
+            let mut retry = button(text("Retry join").size(11)).padding(4);
+            if !state.reconnecting && state.xmpp_cmd_tx.is_some() {
+                retry = retry.on_press(Message::ScopedRoomRetry(state.room_retry_context(jid)));
+            }
+            entry = entry.push(retry);
+        }
+        items.push(super::identity::instance(entry.into(), ("pending-room-entry", state.room_retry_context(jid))));
     }
 
     let list = scrollable(
         column(items).spacing(2).width(Fill)
-    );
+    ).id("sidebar-rooms")
+        .height(if state.rooms.is_empty() && unopened.is_empty() { Length::Shrink } else { Fill });
 
     // Chats section.
     let chats_header = text("Chats").size(14);
@@ -151,19 +181,20 @@ pub fn view(state: &Snack) -> Element<'_, Message>
         let btn_style = if is_active { style::room_button_active } else { button::text };
 
         let item = button(label)
-            .on_press(Message::SelectChat(i))
+            .on_press(Message::SelectChat(c.jid.clone()))
             .width(Fill)
             .padding(6)
             .style(btn_style);
 
-        chat_items.push(item.into());
+        chat_items.push(super::identity::instance(item.into(), ("chat-entry", c.jid.clone())));
     }
 
     let chats_list = scrollable(
         column(chat_items).spacing(2).width(Fill)
-    );
+    ).id("sidebar-chats")
+        .height(if state.chats.is_empty() { Length::Shrink } else { Fill });
 
-    return container(
+    let content: Element<'_, Message> = container(
         column![account_row, sidebar_header, list, chats_header, chats_list].spacing(8).width(Fill)
     )
     .width(Length::Fixed(200.0))
@@ -171,4 +202,22 @@ pub fn view(state: &Snack) -> Element<'_, Message>
     .padding(8)
     .style(container::bordered_box)
     .into();
+    let channel = state.xmpp_cmd_rx.clone();
+    let profile = state.connected_jid.clone();
+    let identity = ("sidebar", channel.clone(), profile.clone());
+    let content = content.map(move |message| {
+        use crate::message::SidebarAction;
+        let action = match message {
+            Message::SelectRoom(jid) => SidebarAction::SelectRoom(jid),
+            Message::SelectChat(jid) => SidebarAction::SelectChat(jid),
+            Message::Disconnect => SidebarAction::Disconnect,
+            Message::ForgetAutoLogin => SidebarAction::ForgetAutoLogin,
+            Message::ForceReconnect => SidebarAction::ForceReconnect,
+            Message::ShowJoinPanel => SidebarAction::ShowJoinPanel,
+            Message::RetryCredentialRemoval => SidebarAction::RetryCredentialRemoval,
+            other => return other,
+        };
+        Message::ScopedSidebar { channel: channel.clone(), profile: profile.clone(), action }
+    });
+    super::identity::instance(content, identity)
 }

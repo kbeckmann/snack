@@ -24,3 +24,6 @@ target
 # Added by cargo
 
 /target
+# Local diagnostic logs can contain private chat details.
+*.log
+.DS_Store

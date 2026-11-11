@@ -29,7 +29,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
 
             let (tooltip_text, on_press) = match u.jid.as_deref()
             {
-                Some(jid) => (jid.to_string(), Some(Message::StartChat(jid.to_string()))),
+                Some(jid) => (jid.to_string(), Some(Message::OpenMemberChat { context: state.composer_id, nick: u.name.clone(), jid: jid.to_string() })),
                 None => ("JID not available in this room".to_string(), None),
             };
 
@@ -42,14 +42,14 @@ pub fn view(state: &Snack) -> Element<'_, Message>
                 name_btn = name_btn.on_press(msg);
             }
 
-            tooltip(
+            crate::ui::identity::instance(tooltip(
                 name_btn,
                 container(text(tooltip_text).size(12)).padding(4).style(container::bordered_box),
                 tooltip::Position::Right,
-            ).into()
+            ).into(), ("member", u.name.clone(), u.jid.clone()))
         }).collect();
 
-        return container(
+        let panel: Element<'_, Message> = container(
             column![
                 text(format!("Members ({})", member_count)).size(12),
                 scrollable(
@@ -62,6 +62,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
         .padding(8)
         .style(container::bordered_box)
         .into();
+        return crate::ui::identity::instance(panel, ("members", state.composer_id));
     }
     else
     {

@@ -1,5 +1,5 @@
 use iced::{ Element, Fill, Length };
-use iced::widget::{ button, checkbox, column, container, row, text, text_input, Id };
+use iced::widget::{ button, checkbox, column, row, text, text_input, Id };
 
 use crate::{ Message, Snack, JOIN_INPUT_ID };
 
@@ -42,7 +42,7 @@ pub fn view(state: &Snack) -> Element<'_, Message>
     }
 
     let mut buttons = row![].spacing(8);
-    if state.active.is_some() && !joining
+    if (state.active.is_some() || !state.unopened_room_jids().is_empty()) && !joining
     {
         let cancel_btn = button(text("Cancel").size(14))
             .on_press(Message::HideJoinPanel)
@@ -57,16 +57,25 @@ pub fn view(state: &Snack) -> Element<'_, Message>
         join_input,
         save_checkbox,
         buttons,
-    ].spacing(12).align_x(iced::Alignment::Center);
+    ].spacing(12).align_x(iced::Alignment::Center).width(Fill);
 
     if let Some(ref err) = state.join_error
     {
         form = form.push(text(err.clone()).size(14));
     }
 
-    return container(form)
-            .center(Fill)
-            .width(Fill)
-            .height(Fill)
-            .into();
+    let form = super::centered_form(form, "join-form-scroll");
+    let context = state.composer_id;
+    let form = form.map(move |message| {
+        use crate::message::JoinFormAction;
+        let action = match message {
+            Message::JoinInputChanged(value) => JoinFormAction::Input(value),
+            Message::SaveRoomToggled(value) => JoinFormAction::Save(value),
+            Message::JoinRoom => JoinFormAction::Submit,
+            Message::HideJoinPanel => JoinFormAction::Cancel,
+            other => return other,
+        };
+        Message::ScopedJoinForm { context, action }
+    });
+    crate::ui::identity::instance(form, ("join-form", context, joining))
 }

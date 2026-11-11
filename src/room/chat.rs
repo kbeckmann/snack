@@ -1,12 +1,49 @@
-use crate::room::message;
+use crate::room::{ backlog, message };
 
 pub struct Chat
 {
     pub jid: String,
     pub title: String,
     pub messages: Vec<message::Message>,
+    // Messages without a DB copy that are outside the rendered history window.
+    pub parked_messages: Vec<message::Message>,
     pub unread: bool,
-    // Index of the first message that arrived while this chat was not being watched.
-    // Mirrors `Room::read_marker` semantics.
+    // Visible projection of read_boundary; the identity survives window changes.
     pub read_marker: Option<usize>,
+    pub read_boundary: Option<backlog::ReadBoundary>,
+    // Windowed-history bookkeeping; see room::backlog::Backlog.
+    pub oldest_loaded_id: Option<i64>,
+    pub local_cursor: Option<(i64, i64)>,
+    pub has_older: bool,
+    pub at_live_tail: bool,
+    pub anchored_bottom: bool,
+    pub mam_in_flight: bool,
+    pub mam_exhausted: bool,
+    pub mam_cursor: Option<String>,
+}
+
+impl backlog::Backlog for Chat
+{
+    fn messages(&self) -> &Vec<message::Message> { &self.messages }
+    fn messages_mut(&mut self) -> &mut Vec<message::Message> { &mut self.messages }
+    fn parked_messages_mut(&mut self) -> &mut Vec<message::Message> { &mut self.parked_messages }
+    fn read_boundary(&self) -> Option<backlog::ReadBoundary> { self.read_boundary }
+    fn set_read_boundary(&mut self, boundary: Option<backlog::ReadBoundary>) { self.read_boundary = boundary; }
+    fn read_marker(&self) -> Option<usize> { self.read_marker }
+    fn set_read_marker(&mut self, m: Option<usize>) { self.read_marker = m; }
+    fn oldest_loaded_id(&self) -> Option<i64> { self.oldest_loaded_id }
+    fn set_oldest_loaded_id(&mut self, id: Option<i64>) { self.oldest_loaded_id = id; }
+    fn local_cursor(&self) -> Option<(i64, i64)> { self.local_cursor }
+    fn set_local_cursor(&mut self, cursor: Option<(i64, i64)>) { self.local_cursor = cursor; }
+    fn has_older(&self) -> bool { self.has_older }
+    fn set_has_older(&mut self, v: bool) { self.has_older = v; }
+    fn set_at_live_tail(&mut self, v: bool) { self.at_live_tail = v; }
+    fn anchored_bottom(&self) -> bool { self.anchored_bottom }
+    fn set_anchored_bottom(&mut self, v: bool) { self.anchored_bottom = v; }
+    fn mam_in_flight(&self) -> bool { self.mam_in_flight }
+    fn set_mam_in_flight(&mut self, v: bool) { self.mam_in_flight = v; }
+    fn mam_exhausted(&self) -> bool { self.mam_exhausted }
+    fn set_mam_exhausted(&mut self, v: bool) { self.mam_exhausted = v; }
+    fn mam_cursor(&self) -> Option<String> { self.mam_cursor.clone() }
+    fn set_mam_cursor(&mut self, v: Option<String>) { self.mam_cursor = v; }
 }
