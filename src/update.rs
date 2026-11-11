@@ -3238,6 +3238,9 @@ impl Snack
                         // Notify on a mention while the window isn't being watched.
                         // Check the event body directly so it works even when the
                         // message wasn't appended (user scrolled into history).
+                        if !is_own && room::message::mentions(&body, &own_nick) {
+                            log::debug!("Mention in {room}: {}", if self.window_focused { "window focused, no alert" } else { "sending alert" });
+                        }
                         if !self.window_focused && !is_own
                             && room::message::mentions(&body, &own_nick)
                         {
@@ -3345,6 +3348,8 @@ impl Snack
                         // window isn't being watched. Use the event body directly
                         // so it works even if the message wasn't appended (user
                         // scrolled into history).
+                        log::debug!("Direct message from {}: {}", self.chats[idx].jid,
+                            if self.window_focused { "window focused, no alert" } else { "sending alert" });
                         if !self.window_focused
                         {
                             crate::notifications::send(&self.chats[idx].title, &body);

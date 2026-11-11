@@ -66,7 +66,11 @@ impl Dispatcher
 pub fn send(summary: &str, body: &str)
 {
     static DISPATCHER: Dispatcher = Dispatcher { sender: Mutex::new(None) };
-    DISPATCHER.send(Notice::new(summary, body), show);
+    if DISPATCHER.send(Notice::new(summary, body), show) {
+        log::debug!("Queued desktop alert \"{summary}\"");
+    } else {
+        log::warn!("Dropped desktop alert \"{summary}\": the notification worker is busy or unavailable");
+    }
 }
 
 fn prepare_notification(notice: &Notice, body_markup: Result<bool, String>) -> Result<notify_rust::Notification, String>
@@ -93,9 +97,62 @@ fn show(notice: Notice)
         .map_err(|error| format!("Could not inspect desktop notification capabilities: {error}"));
     #[cfg(not(all(unix, not(target_os = "macos"))))]
     let body_markup = Ok(false);
+    #[cfg(target_os = "macos")]
+    if !macos::sender_ready() { return; }
+    log::debug!("Showing desktop alert \"{}\" ({} characters)", notice.summary, notice.body.chars().count());
+    let started = std::time::Instant::now();
     let result = prepare_notification(&notice, body_markup)
         .and_then(|notification| notification.show().map(|_| ()).map_err(|error| error.to_string()));
-    if let Err(error) = result { log::warn!("Failed to send notification: {error}"); }
+    match result {
+        Ok(()) => log::debug!("Desktop alert \"{}\" accepted by the system after {:?}", notice.summary, started.elapsed()),
+        Err(error) => log::warn!("Failed to send notification \"{}\": {error}", notice.summary),
+    }
+}
+
+// macOS delivers a notification on behalf of an application bundle. Without
+// one, the notification library asks AppleScript for an app named
+// "use_default", which makes macOS show a "Where is use_default?" chooser;
+// cancelling it leaves alerts without a valid sender. Choose a registered
+// bundle up front: Snack's own when running from snack.app (or when one is
+// installed), else the app that launched a development build, e.g. Terminal.
+#[cfg(all(target_os = "macos", not(test)))]
+mod macos
+{
+    use std::sync::OnceLock;
+
+    fn registered(bundle: &str) -> bool
+    {
+        use objc2_app_kit::NSWorkspace;
+        use objc2_foundation::NSString;
+        unsafe { NSWorkspace::sharedWorkspace().URLForApplicationWithBundleIdentifier(&NSString::from_str(bundle)) }.is_some()
+    }
+
+    fn sender() -> Option<String>
+    {
+        use objc2_foundation::NSBundle;
+        let own = unsafe { NSBundle::mainBundle().bundleIdentifier() }.map(|bundle| bundle.to_string());
+        let launcher = std::env::var("__CFBundleIdentifier").ok();
+        log::debug!("Notification sender candidates: own bundle {own:?}, launcher {launcher:?}");
+        [own, Some("org.snack.snack".to_string()), launcher, Some("com.apple.Terminal".to_string())]
+            .into_iter().flatten().find(|bundle| {
+                let found = registered(bundle);
+                log::debug!("Notification sender {bundle}: {}", if found { "registered" } else { "not registered" });
+                found
+            })
+    }
+
+    // The library allows setting its sender once per process.
+    pub fn sender_ready() -> bool
+    {
+        static READY: OnceLock<bool> = OnceLock::new();
+        *READY.get_or_init(|| match sender() {
+            Some(bundle) => match notify_rust::set_application(&bundle) {
+                Ok(()) => { log::debug!("Sending notifications as {bundle}"); true }
+                Err(error) => { log::warn!("Cannot send notifications as {bundle}: {error}"); false }
+            },
+            None => { log::warn!("No registered application can send notifications; alerts are disabled"); false }
+        })
+    }
 }
 
 // Application tests may exercise unfocused-message behavior. Never display a

@@ -77,7 +77,9 @@ Neither confirmation proves recipient delivery or reading. Uncertain queued atte
 
 If local storage is unavailable, an online send can proceed without a durable retry queue; its recovery guarantees are weaker. Offline sends retain the composer text when they cannot be queued.
 
-Desktop alerts use short, literal text previews and a bounded background queue. A busy notification service can cause excess alerts to be skipped; message processing remains independent of the notification service.
+Desktop alerts use short, literal text previews and a bounded background queue. A busy notification service can cause excess alerts to be skipped; message processing remains independent of the notification service. Alerts are shown only while Snack's window is not focused.
+
+On macOS, alerts come from Snack when it runs as `snack.app` or once a `snack.app` has been opened on that Mac; otherwise they come from the application that launched Snack, such as your terminal. macOS lists that application under System Settings → Notifications, where **Allow notifications** must be switched on; the first alert's banner only asks for it.
 
 ## TLS policy
 
