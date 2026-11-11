@@ -3,6 +3,7 @@
 use iced::{ Application, Program, Theme };
 
 mod app;
+mod notifications;
 mod message;
 mod room;
 mod storage;

@@ -1,6 +1,6 @@
 use iced::Task;
 use iced::widget::{ text_editor, Id };
-use log::{ error, warn };
+use log::error;
 
 use crate::app::{
     delay_then, focus_input, focus_jid_input, focus_join_input, snap_to_bottom,
@@ -19,25 +19,6 @@ const SEND_PENDING_GRACE: std::time::Duration = std::time::Duration::from_millis
 // as failed. Kept generous so a merely-slow connection doesn't false-flag; a late
 // echo still upgrades it back to confirmed regardless.
 const SEND_FAIL_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
-
-fn send_notification(summary: &str, body: &str)
-{
-    // notify_rust's `show()` is a blocking call. Running it inline on the UI thread
-    // means a slow or unresponsive daemon stalls `update()`, which backs up iced's
-    // shared message sink.
-    let summary = summary.to_string();
-    let body = body.to_string();
-    std::thread::spawn(move ||
-    {
-        if let Err(e) = notify_rust::Notification::new()
-            .summary(&summary)
-            .body(&body)
-            .show()
-        {
-            warn!("Failed to send notification: {}", e);
-        }
-    });
-}
 
 impl Snack
 {
@@ -754,7 +735,7 @@ impl Snack
                                     {
                                         let room_name =
                                             room.split('@').next().unwrap_or(&room);
-                                        send_notification(
+                                        crate::notifications::send(
                                             &format!("{} in {}", nick, room_name),
                                             body,
                                         );
@@ -820,7 +801,7 @@ impl Snack
                             if let Some(room::message::Message::Chat { from, body, .. }) =
                                 self.chats[idx].messages.last()
                             {
-                                send_notification(from, body);
+                                crate::notifications::send(from, body);
                             }
                         }
 
