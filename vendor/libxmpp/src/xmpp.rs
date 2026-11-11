@@ -325,15 +325,29 @@ async fn do_sasl_scram(
     let response_xml = scram.response_xml(&challenge_b64).map_err(XmppError::Auth)?;
     tcp.send(response_xml.as_bytes()).await?;
 
-    // Read <success>
+    // Servers may send their final proof as a challenge instead of bundling it
+    // with success (RFC6120 6.3.10). Verify it before acknowledging with an empty
+    // response, then still require the server's explicit successful outcome.
     let success_xml = read_frame(tcp, framer).await?;
     if stanza::sasl::is_failure(&success_xml)
     {
         return Err(XmppError::Auth(success_xml));
     }
 
-    let success_b64 = stanza::sasl::parse_success(&success_xml).map_err(XmppError::Parse)?;
-    scram.verify_success(&success_b64).map_err(XmppError::Auth)?;
+    if stanza::xml::is_element(&success_xml, b"challenge", b"urn:ietf:params:xml:ns:xmpp-sasl") {
+        let proof = stanza::sasl::parse_challenge(&success_xml).map_err(XmppError::Parse)?;
+        scram.verify_success(&proof).map_err(XmppError::Auth)?;
+        tcp.send(b"<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>").await?;
+        let outcome = read_frame(tcp, framer).await?;
+        if stanza::sasl::is_failure(&outcome) { return Err(XmppError::Auth(outcome)); }
+        let additional = stanza::sasl::parse_success(&outcome).map_err(XmppError::Auth)?;
+        if !additional.is_empty() && additional != "=" {
+            return Err(XmppError::Auth("Unexpected data after SCRAM server proof".into()));
+        }
+    } else {
+        let success_b64 = stanza::sasl::parse_success(&success_xml).map_err(XmppError::Parse)?;
+        scram.verify_success(&success_b64).map_err(XmppError::Auth)?;
+    }
 
     return Ok(());
 }
@@ -352,6 +366,11 @@ async fn do_sasl_plain(
         return Err(XmppError::Auth(response_xml));
     }
 
+    let additional_data = stanza::sasl::parse_success(&response_xml).map_err(XmppError::Auth)?;
+    if !additional_data.is_empty() && additional_data != "="
+    {
+        return Err(XmppError::Auth("Unexpected additional data in SASL PLAIN success".to_string()));
+    }
     return Ok(());
 }
 
@@ -1574,6 +1593,97 @@ mod tests
         assert!(framer.try_next().is_none());
         assert!(is_bind_reply("<iq xmlns='jabber:client' from='example' type='error' id='bind_1'/>", "bind_1", "example"));
         assert!(!is_bind_reply("<iq xmlns='jabber:client' from='example/resource' type='result' id='bind_1'/>", "bind_1", "example"));
+    }
+
+    async fn rfc5802_exchange(finish: &str) -> (Result<(), XmppError>, String) {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        use tokio::io::AsyncReadExt;
+        let namespace = "urn:ietf:params:xml:ns:xmpp-sasl";
+        let first = BASE64.encode("r=fyko+d2lbbFgONRv9qkxdawL3rfcNHYJY1ZVvWVs7j,s=QSXCR+Q6sek8bf92,i=4096");
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let socket = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+        let (mut server, _) = listener.accept().await.unwrap();
+        let mut tcp = Tcp::Connected(socket, "localhost".into());
+        let mut framer = XmlFramer::new_client_stream();
+        framer.feed(format!("<challenge xmlns='{namespace}'>{first}</challenge>{finish}").as_bytes());
+        let result = tokio::time::timeout(std::time::Duration::from_secs(2),
+            do_sasl_scram(&mut tcp, &mut framer, &mut stanza::sasl::rfc5802_client())).await.unwrap();
+        drop(tcp);
+        let mut sent = String::new();
+        tokio::time::timeout(std::time::Duration::from_secs(1), server.read_to_string(&mut sent)).await.unwrap().unwrap();
+        (result, sent)
+    }
+
+    #[tokio::test]
+    async fn scram_accepts_server_proof_in_a_final_challenge_before_success() {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        let namespace = "urn:ietf:params:xml:ns:xmpp-sasl";
+        let proof = BASE64.encode("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
+        for additional_challenge in [true, false] {
+            let finish = if additional_challenge {
+                format!("<s:challenge xmlns:s='{namespace}'>{proof}</s:challenge><success xmlns='{namespace}'/>")
+            } else { format!("<success xmlns='{namespace}'>{proof}</success>") };
+            let (result, sent) = rfc5802_exchange(&finish).await;
+            assert!(result.is_ok(), "additional_challenge={additional_challenge}: {result:?}");
+            assert_eq!(sent.matches("<response ").count(), if additional_challenge { 2 } else { 1 });
+            if additional_challenge { assert!(sent.ends_with("<response xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>")); }
+        }
+    }
+
+    #[tokio::test]
+    async fn scram_does_not_acknowledge_an_invalid_final_challenge() {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        let namespace = "urn:ietf:params:xml:ns:xmpp-sasl";
+        for proof in [BASE64.encode("v=AAAA"), BASE64.encode("e=invalid-proof"), "not-base64".into(), String::new()] {
+            let finish = format!("<challenge xmlns='{namespace}'>{proof}</challenge><success xmlns='{namespace}'/>");
+            let (result, sent) = rfc5802_exchange(&finish).await;
+            assert!(result.is_err(), "{proof}");
+            assert_eq!(sent.matches("<response ").count(), 1, "an unverified server must not receive the final acknowledgement");
+        }
+    }
+
+    #[tokio::test]
+    async fn scram_final_challenge_still_requires_an_empty_success_outcome() {
+        use base64::{Engine, engine::general_purpose::STANDARD as BASE64};
+        let namespace = "urn:ietf:params:xml:ns:xmpp-sasl";
+        let proof = BASE64.encode("v=rmF9pqV8S7suAoZWja4dJRkFsKQ=");
+        for (outcome, succeeds) in [
+            (format!("<s:success xmlns:s='{namespace}'>=</s:success>"), true),
+            (format!("<failure xmlns='{namespace}'><not-authorized/></failure>"), false),
+            ("<success xmlns='unrelated'/>".into(), false),
+            (format!("<success xmlns='{namespace}'>{proof}</success>"), false),
+            (format!("<challenge xmlns='{namespace}'>{proof}</challenge>"), false),
+            ("</stream:stream>".into(), false),
+        ] {
+            let (result, sent) = rfc5802_exchange(&format!("<challenge xmlns='{namespace}'>{proof}</challenge>{outcome}")).await;
+            assert_eq!(result.is_ok(), succeeds, "{outcome}: {result:?}");
+            assert_eq!(sent.matches("<response ").count(), 2);
+        }
+    }
+
+    #[tokio::test]
+    async fn plain_authentication_requires_sasl_success()
+    {
+        for (response, expected_success) in [
+            ("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>", true),
+            ("<s:success xmlns:s='urn:ietf:params:xml:ns:xmpp-sasl'>=</s:success>", true),
+            ("<failure xmlns='urn:ietf:params:xml:ns:xmpp-sasl'><not-authorized/></failure>", false),
+            ("<s:failure xmlns:s='urn:ietf:params:xml:ns:xmpp-sasl'/>", false),
+            ("<challenge xmlns='urn:ietf:params:xml:ns:xmpp-sasl'/>", false),
+            ("<message><body>hello</body></message>", false),
+            ("<success xmlns='unrelated'/>", false),
+            ("<success xmlns='urn:ietf:params:xml:ns:xmpp-sasl'>unexpected</success>", false),
+        ]
+        {
+            let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+            let connection = tokio::net::TcpStream::connect(listener.local_addr().unwrap()).await.unwrap();
+            let (_server, _) = listener.accept().await.unwrap();
+            let mut tcp = Tcp::Connected(connection, "localhost".into());
+            let mut framer = XmlFramer::new_client_stream();
+            framer.feed(response.as_bytes());
+            let auth = stanza::sasl::PlainAuth::new("user", "secret");
+            assert_eq!(do_sasl_plain(&mut tcp, &mut framer, &auth).await.is_ok(), expected_success, "{response}");
+        }
     }
 
     /// Build a [`SharedWriter`] backed by a real loopback socket, returning the

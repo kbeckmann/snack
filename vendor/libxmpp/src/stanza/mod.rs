@@ -1,5 +1,6 @@
 pub mod stream;
 pub mod sasl;
+mod saslprep;
 pub mod bind;
 pub mod muc;
 pub mod chat;
