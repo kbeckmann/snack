@@ -86,19 +86,29 @@ pub struct ScramClient<D>
     _marker: PhantomData<D>,
 }
 
+// Uniformly random letters and digits from the OS generator. Rejecting
+// bytes outside 0..248 keeps every one of the 62 symbols equally likely.
+pub(crate) fn random_alphanumeric(length: usize) -> String
+{
+    const ALPHABET: &[u8; 62] = b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    let mut out = String::with_capacity(length);
+    let mut bytes = [0u8; 64];
+    while out.len() < length {
+        getrandom::fill(&mut bytes).expect("the operating system random number generator failed");
+        for byte in bytes {
+            if byte < 248 && out.len() < length { out.push(ALPHABET[usize::from(byte % 62)] as char); }
+        }
+    }
+    out
+}
+
 impl<D> ScramClient<D>
 where
     D: EagerHash,
 {
     pub fn new(username: &str, password: &str, mechanism_name: &'static str) -> Self
     {
-        use rand::RngExt;
-
-        let nonce: String = rand::rng()
-            .sample_iter(&rand::distr::Alphanumeric)
-            .take(24)
-            .map(char::from)
-            .collect();
+        let nonce = random_alphanumeric(24);
 
         return Self
         {

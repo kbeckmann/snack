@@ -51,9 +51,6 @@ features = ["serialize"]
 [dependencies.getrandom]
 version = "0.4"
 
-[dependencies.rand]
-version = "0.10.1"
-
 [dependencies.serde]
 version = "1.0.228"
 features = ["derive"]
