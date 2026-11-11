@@ -11128,7 +11128,10 @@ fn long_unbroken_words_wrap_inside_the_transcript_and_composer() {
     let url = format!("https://example.org/project/commit/{}#diff-{}", "a1b2c3d4".repeat(5), "0123456789abcdef".repeat(4));
     let body = format!("a little code {url} :)");
     let mut s = state();
-    s.chats[0] = chat("alice@example", &[&body]);
+    // Enough earlier messages that the transcript scrolls and shows its scrollbar.
+    let mut bodies = vec!["earlier message"; 60];
+    bodies.push(&body);
+    s.chats[0] = chat("alice@example", &bodies);
     s.body_editors.clear();
     s.sync_body_editors();
     s.message_input = text_editor::Content::with_text(&url);
@@ -11151,5 +11154,7 @@ fn long_unbroken_words_wrap_inside_the_transcript_and_composer() {
     assert!(narrow_body.height >= 5.0 * 18.0, "body did not wrap the URL: {narrow_body:?}");
     assert!(narrow_body.height > wide_body.height, "body did not wrap the URL: {narrow_body:?} vs {wide_body:?}");
     assert!(narrow_composer.height > wide_composer.height, "composer did not wrap the URL: {narrow_composer:?} vs {wide_composer:?}");
-    assert!(narrow_body.x + narrow_body.width <= 400.0 && narrow_composer.x + narrow_composer.width <= 400.0);
+    assert!(narrow_composer.x + narrow_composer.width <= 400.0);
+    // Message text keeps clear of the 10px transcript scrollbar and its gap.
+    assert!(narrow_body.x + narrow_body.width <= 400.0 - 18.0, "body runs under the scrollbar: {narrow_body:?}");
 }

@@ -107,9 +107,13 @@ fn render_messages<'a>(
     iced::widget::responsive(move |size| render_messages_at_width(
         msgs, read_marker, &history_markers, my_nick.as_deref(), has_older,
         find.as_ref(), &selected, body_editors, dragging, primary_down,
-        context, selection, size.width,
+        context, selection, (size.width - SCROLLBAR_WIDTH - SCROLLBAR_GAP).max(0.0),
     )).into()
 }
+
+/// The transcript scrollbar and the gap between it and the messages.
+const SCROLLBAR_WIDTH: f32 = 10.0;
+const SCROLLBAR_GAP: f32 = 8.0;
 
 fn render_messages_at_width<'a>(
     msgs: &'a [RoomMessage],
@@ -388,6 +392,10 @@ fn render_messages_at_width<'a>(
     .id(Id::new(MESSAGE_SCROLL_ID))
     // Bottom-anchored: pins to the newest message, and — crucially — keeps the
     // viewport visually fixed when older history is prepended on scroll-up.
+    // Reserve the scrollbar's own column so text never runs underneath it.
+    // This replaces the scrollbar settings, so it must precede anchor_bottom.
+    .direction(iced::widget::scrollable::Direction::Vertical(
+        iced::widget::scrollable::Scrollbar::new().width(SCROLLBAR_WIDTH).scroller_width(SCROLLBAR_WIDTH).spacing(SCROLLBAR_GAP)))
     .anchor_bottom()
     .on_scroll(Message::MessagesScrolled)
     .height(Fill)
