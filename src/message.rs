@@ -5,6 +5,7 @@ use crate::xmpp;
 #[derive(Debug, Clone)]
 pub enum ComposerAction {
     Input(text_editor::Action),
+    Edit(crate::ui::composer_keys::EditCommand),
     Undo,
     Redo,
     Send,
@@ -129,6 +130,8 @@ pub enum Message
     // Internal editing operations; composer widgets emit ScopedComposer and
     // the update handler validates its identity before dispatching these.
     InputAction(text_editor::Action),
+    // A platform-native editing command that needs the composer's text.
+    ComposerEdit(crate::ui::composer_keys::EditCommand),
     UndoInput,
     RedoInput,
     CleanMessageInput,

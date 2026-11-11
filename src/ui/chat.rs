@@ -436,10 +436,13 @@ fn input_row(state: &Snack) -> Element<'_, Message>
                 } else { Message::UndoInput }));
             }
             // Plain Enter sends the message. Alt+Enter (and Shift+Enter as a
-            // common alternative) inserts a newline instead.
+            // common alternative) inserts a newline instead, as does
+            // Ctrl+Enter on macOS (Cocoa's insertLineBreak).
             if matches!(press.key, keyboard::Key::Named(keyboard::key::Named::Enter))
             {
-                if press.modifiers.alt() || press.modifiers.shift()
+                let mac_line_break = super::composer_keys::CURRENT == super::composer_keys::Platform::MacOs
+                    && press.modifiers.control();
+                if press.modifiers.alt() || press.modifiers.shift() || mac_line_break
                 {
                     return Some(text_editor::Binding::Enter);
                 }
@@ -459,6 +462,9 @@ fn input_row(state: &Snack) -> Element<'_, Message>
                 {
                     return Some(text_editor::Binding::Custom(Message::NextSelection));
                 }
+            }
+            if let Some(binding) = super::composer_keys::binding(super::composer_keys::CURRENT, &press.key, press.modifiers) {
+                return Some(binding);
             }
             return text_editor::Binding::from_key_press(press);
         })
@@ -481,6 +487,7 @@ fn input_row(state: &Snack) -> Element<'_, Message>
         use crate::message::ComposerAction;
         let action = match message {
             Message::InputAction(action) => ComposerAction::Input(action),
+            Message::ComposerEdit(command) => ComposerAction::Edit(command),
             Message::UndoInput => ComposerAction::Undo,
             Message::RedoInput => ComposerAction::Redo,
             Message::SendMessage => ComposerAction::Send,

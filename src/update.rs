@@ -1967,6 +1967,81 @@ impl Snack
         }
     }
 
+    fn composer_selects_text(&self) -> bool
+    {
+        let cursor = self.message_input.cursor();
+        cursor.selection.is_some_and(|start| start != cursor.position)
+    }
+
+    fn composer_action(&mut self, action: text_editor::Action)
+    {
+        let _ = self.update_inner(Message::InputAction(action));
+    }
+
+    // Place the caret at `position`, extending the selection when `select`.
+    fn place_composer_caret(&mut self, position: text_editor::Position, select: bool)
+    {
+        let cursor = self.message_input.cursor();
+        let anchor = cursor.selection.unwrap_or(cursor.position);
+        if !select {
+            // move_to without a selection keeps the old one; a motion clears it.
+            self.message_input.perform(text_editor::Action::Move(text_editor::Motion::DocumentStart));
+        }
+        self.message_input.move_to(text_editor::Cursor { position, selection: select.then_some(anchor) });
+        self.input_history.break_group();
+        self.clear_body_selection();
+        self.nick_complete = None;
+    }
+
+    // Delete the selection, or else the text from the caret to a boundary.
+    fn delete_composer_text(&mut self, boundary: text_editor::Motion, forward: bool)
+    {
+        if !self.composer_selects_text() {
+            self.composer_action(text_editor::Action::Select(boundary));
+            if !self.composer_selects_text() { return; }
+        }
+        self.composer_action(text_editor::Action::Edit(if forward { text_editor::Edit::Delete } else { text_editor::Edit::Backspace }));
+    }
+
+    // Platform editing commands from crate::ui::composer_keys. Positions are
+    // logical lines (paragraphs) and byte columns.
+    fn composer_edit(&mut self, command: crate::ui::composer_keys::EditCommand)
+    {
+        use crate::ui::composer_keys::EditCommand;
+        use text_editor::{Action, Motion, Position};
+        let text = self.message_input.text();
+        let lines: Vec<&str> = text.split('\n').collect();
+        let position = self.message_input.cursor().position;
+        let line = lines.get(position.line).copied().unwrap_or_default();
+        let at = |line: usize, column: usize| Position { line, column };
+        match command {
+            EditCommand::DeleteWordBackward => self.delete_composer_text(Motion::WordLeft, false),
+            EditCommand::DeleteWordForward => self.delete_composer_text(Motion::WordRight, true),
+            EditCommand::DeleteToLineStart => self.delete_composer_text(Motion::Home, false),
+            EditCommand::Vertical { down, select } => {
+                let step = if down { Motion::Down } else { Motion::Up };
+                self.composer_action(if select { Action::Select(step) } else { Action::Move(step) });
+                // NSTextView moves to the start/end past the first/last line.
+                if self.message_input.cursor().position == position {
+                    let edge = if down { Motion::DocumentEnd } else { Motion::DocumentStart };
+                    self.composer_action(if select { Action::Select(edge) } else { Action::Move(edge) });
+                }
+            }
+            EditCommand::ParagraphStep { forward, select, next_start } => {
+                let target = if !forward {
+                    if position.column > 0 { at(position.line, 0) }
+                    else if position.line > 0 { at(position.line - 1, 0) }
+                    else { position }
+                } else if next_start {
+                    if position.line + 1 < lines.len() { at(position.line + 1, 0) } else { at(position.line, line.len()) }
+                } else if position.column < line.len() { at(position.line, line.len()) }
+                else if position.line + 1 < lines.len() { at(position.line + 1, lines[position.line + 1].len()) }
+                else { position };
+                self.place_composer_caret(target, select);
+            }
+        }
+    }
+
     // A press on a link opens it only if it ended as a plain click: dragging
     // a selection across or out of the link never launches a browser.
     pub(crate) fn take_link_click(&mut self) -> Option<String>
@@ -3740,6 +3815,7 @@ impl Snack
                 use crate::message::ComposerAction;
                 return self.update_inner(match action {
                     ComposerAction::Input(action) => Message::InputAction(action),
+                    ComposerAction::Edit(command) => Message::ComposerEdit(command),
                     ComposerAction::Undo => Message::UndoInput,
                     ComposerAction::Redo => Message::RedoInput,
                     ComposerAction::Send => Message::SendMessage,
@@ -3771,6 +3847,7 @@ impl Snack
                     }
                 }
             }
+            Message::ComposerEdit(command) => { self.composer_edit(command); }
             Message::UndoInput => {
                 self.send_error = None;
                 self.input_history.undo(&mut self.message_input);

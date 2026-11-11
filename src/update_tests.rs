@@ -409,7 +409,7 @@ fn current_conversation_close_buttons_and_shortcuts_target_only_the_visible_owne
             s.message_input = text_editor::Content::with_text("first preserved draft");
             let shortcut = |context| {
                 let iced::Event::Keyboard(event) = composer_key(iced::keyboard::Key::Character("w".into()), None,
-                    if rooms { iced::keyboard::Modifiers::CTRL } else { iced::keyboard::Modifiers::COMMAND }) else { unreachable!() };
+                    iced::keyboard::Modifiers::COMMAND) else { unreachable!() };
                 crate::subscription::keyboard_event(context, event)
             };
             let stale = shortcut(s.composer_id);
@@ -1363,6 +1363,106 @@ fn navigation_requires_the_current_connection_even_for_the_same_profile() {
     assert_eq!(s.active_conv_jid().as_deref(), Some("bob@example"));
 }
 
+fn composer_with(text: &str, line: usize, column: usize) -> Snack {
+    let mut s = state();
+    s.message_input = text_editor::Content::with_text(text);
+    s.message_input.move_to(text_editor::Cursor { position: text_editor::Position { line, column }, selection: None });
+    s
+}
+
+fn caret(s: &Snack) -> (usize, usize) {
+    let position = s.message_input.cursor().position;
+    (position.line, position.column)
+}
+
+#[test]
+fn native_word_and_line_deletion_removes_only_to_the_boundary_and_is_one_undo_step() {
+    use crate::ui::composer_keys::EditCommand;
+    let mut s = composer_with("hello brave world", 0, 17);
+    let _ = s.update(Message::ComposerEdit(EditCommand::DeleteWordBackward));
+    assert_eq!(s.message_input.text(), "hello brave ");
+    let _ = s.update(Message::UndoInput);
+    assert_eq!(s.message_input.text(), "hello brave world", "a word deletion undoes in one step");
+
+    let mut s = composer_with("hello brave world", 0, 6);
+    let _ = s.update(Message::ComposerEdit(EditCommand::DeleteWordForward));
+    assert_eq!(s.message_input.text(), "hello  world");
+
+    // An existing selection is deleted instead of extending it.
+    let mut s = composer_with("hello brave world", 0, 9);
+    s.message_input.move_to(text_editor::Cursor { position: text_editor::Position { line: 0, column: 9 },
+        selection: Some(text_editor::Position { line: 0, column: 7 }) });
+    let _ = s.update(Message::ComposerEdit(EditCommand::DeleteWordBackward));
+    assert_eq!(s.message_input.text(), "hello bve world");
+
+    // Nothing to delete at the start: no character is removed by accident.
+    let mut s = composer_with("hello", 0, 0);
+    let _ = s.update(Message::ComposerEdit(EditCommand::DeleteWordBackward));
+    let _ = s.update(Message::ComposerEdit(EditCommand::DeleteToLineStart));
+    assert_eq!(s.message_input.text(), "hello");
+
+    let mut s = composer_with("first line\nsecond line", 1, 7);
+    let _ = s.update(Message::ComposerEdit(EditCommand::DeleteToLineStart));
+    assert_eq!(s.message_input.text(), "first line\nline");
+}
+
+#[test]
+fn caret_commands_reach_document_and_paragraph_boundaries() {
+    use crate::ui::composer_keys::EditCommand;
+    // macOS: moving up from the first line goes to the start (and selects).
+    let mut s = composer_with("one two", 0, 4);
+    let _ = s.update(Message::ComposerEdit(EditCommand::Vertical { down: false, select: true }));
+    assert_eq!(s.message_input.selection().as_deref(), Some("one "));
+    let mut s = composer_with("one two", 0, 4);
+    let _ = s.update(Message::ComposerEdit(EditCommand::Vertical { down: true, select: false }));
+    assert_eq!(caret(&s), (0, 7));
+    assert!(s.message_input.selection().is_none());
+
+    // Paragraph steps: backward to the start (then the previous paragraph),
+    // forward to the end (GTK, macOS) or the next paragraph's start (Windows).
+    let step = |s: &mut Snack, forward, next_start| {
+        let _ = s.update(Message::ComposerEdit(EditCommand::ParagraphStep { forward, select: false, next_start }));
+        caret(s)
+    };
+    let mut s = composer_with("ab\ncd\nef", 1, 1);
+    assert_eq!(step(&mut s, false, false), (1, 0));
+    assert_eq!(step(&mut s, false, false), (0, 0));
+    assert_eq!(step(&mut s, false, false), (0, 0));
+    assert_eq!(step(&mut s, true, false), (0, 2));
+    assert_eq!(step(&mut s, true, false), (1, 2));
+    assert_eq!(step(&mut s, true, true), (2, 0));
+    assert_eq!(step(&mut s, true, true), (2, 2));
+}
+
+#[test]
+fn focused_composer_routes_native_edit_keys_and_keeps_alt_arrows_for_conversations() {
+    use crate::message::ComposerAction;
+    use crate::ui::composer_keys::EditCommand;
+    use iced::keyboard::{Key, Modifiers, key::Named};
+    let s = state();
+    let word_delete = if cfg!(target_os = "macos") { Modifiers::ALT } else { Modifiers::CTRL };
+    let messages = composer_events(&s, vec![composer_key(Key::Named(Named::Backspace), None, word_delete)]);
+    assert!(messages.iter().any(|m| matches!(m, Message::ScopedComposer { context, action: ComposerAction::Edit(EditCommand::DeleteWordBackward) } if *context == s.composer_id)),
+        "{messages:?}");
+    let messages = composer_events(&s, vec![composer_key(Key::Named(Named::ArrowUp), None, Modifiers::ALT)]);
+    assert!(messages.iter().any(|m| matches!(m, Message::PrevSelection | Message::Navigate { forward: false, .. })), "{messages:?}");
+    assert!(!messages.iter().any(|m| matches!(m, Message::ScopedComposer { .. })));
+}
+
+#[test]
+fn macos_control_letters_are_editing_keys_not_app_shortcuts() {
+    if !cfg!(target_os = "macos") { return; }
+    for key in ["n", "w"] {
+        let mut s = state();
+        s.state = AppState::Connected;
+        s.chats.push(chat("bob@example", &[]));
+        let event = contextual_shortcut(&s, iced::keyboard::Key::Character(key.into()), iced::keyboard::Modifiers::CTRL);
+        let _ = s.update(event);
+        assert!(!s.show_join_panel, "Ctrl-{key} opened the join panel");
+        assert_eq!(s.chats.len(), 2, "Ctrl-{key} closed a conversation");
+    }
+}
+
 // Click a message body to focus it, then send keys to the focused body.
 fn transcript_body_keys(s: &Snack, keys: Vec<iced::Event>) -> Vec<Message> {
     use iced::advanced::widget::operation::{Operation, Focusable};
@@ -1415,7 +1515,7 @@ fn tab_from_a_focused_message_body_returns_to_the_composer() {
 
 #[test]
 fn uppercase_primary_shortcuts_work_without_shift() {
-    for modifiers in [iced::keyboard::Modifiers::COMMAND, iced::keyboard::Modifiers::CTRL] {
+    for modifiers in [iced::keyboard::Modifiers::COMMAND] {
         for key in ["N", "W", "C"] {
             let mut s = state();
             s.state = AppState::Connected;

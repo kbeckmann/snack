@@ -5,6 +5,7 @@ pub mod chat;
 pub(crate) mod message_layout;
 pub(crate) mod identity;
 pub(crate) mod bounded_editor;
+pub(crate) mod composer_keys;
 pub mod join;
 pub mod members;
 

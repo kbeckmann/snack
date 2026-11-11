@@ -120,7 +120,9 @@ pub(crate) fn keyboard_event(context: uuid::Uuid, event: iced::keyboard::Event) 
             }
         }
 
-        let primary = (modifiers.command() || modifiers.control()) && !modifiers.shift() && !modifiers.alt();
+        // Cmd on macOS, Ctrl elsewhere. Control letters on macOS are editing
+        // keys (Ctrl-N moves down, Ctrl-W is unbound), not app shortcuts.
+        let primary = modifiers.command() && !modifiers.shift() && !modifiers.alt();
         if primary
         {
             if matches!(&key, iced::keyboard::Key::Character(k) if k.as_str().eq_ignore_ascii_case("n"))

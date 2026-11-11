@@ -22,8 +22,8 @@ Use Cmd on macOS and Ctrl on other platforms for the primary shortcuts.
 | Action | Shortcut or gesture |
 | --- | --- |
 | Send | Enter |
-| Insert newline | Shift-Enter or Alt-Enter |
-| Undo / redo input | Cmd/Ctrl-Z / Cmd/Ctrl-Shift-Z |
+| Insert newline | Shift-Enter or Alt-Enter (also Ctrl-Enter on macOS) |
+| Undo / redo input | Cmd/Ctrl-Z / Cmd/Ctrl-Shift-Z (also Ctrl-Y on Windows and Linux) |
 | Find in the current conversation | Cmd/Ctrl-F from any focused widget |
 | Search all open conversations | Enable **All rooms** in the find bar |
 | Next / previous find match | Enter / Shift-Enter in the find bar |
@@ -35,6 +35,25 @@ Use Cmd on macOS and Ctrl on other platforms for the primary shortcuts.
 | Copy selected messages or text | Cmd/Ctrl-C; whole-message copies include timestamp and nickname and exit selection mode |
 | Clear selection or close find | Escape |
 | Open a URL | Click it; dragging across it selects text instead |
+
+### Editing in the composer
+
+The composer follows each platform's text-field conventions, so the usual
+system shortcuts work. Alt-Up/Down stay reserved for switching conversations.
+
+| Action | macOS | Windows and Linux |
+| --- | --- | --- |
+| Move / select by word | Alt-Left/Right (+Shift) | Ctrl-Left/Right (+Shift) |
+| Line start / end | Cmd-Left/Right (+Shift) | Home / End (+Shift) |
+| Start / end of the message | Cmd-Up/Down (+Shift) | Ctrl-Home/End (+Shift) |
+| Select to start / end | Shift-Up on the first line, Shift-Down on the last, Shift-Home/End | Ctrl-Shift-Home/End |
+| Paragraph | Alt-Shift-Up/Down selects | Ctrl-Up/Down (+Shift) |
+| Delete word | Alt-Backspace / Alt-Delete | Ctrl-Backspace / Ctrl-Delete |
+| Delete to line start | Cmd-Backspace | Shift-Home, then Backspace |
+| Clipboard | Cmd-X/C/V | Ctrl-X/C/V, Shift-Delete, Ctrl-Insert, Shift-Insert |
+
+On macOS, Home/End and Page Up/Down scroll without moving the caret, as in
+other Cocoa text fields.
 
 ## Persistence and delivery behavior
 
