@@ -32,6 +32,33 @@ fn main() -> Result<(), Box<dyn std::error::Error>>
     Ok(())
 }
 
+// Give the running process a real dock icon. macOS takes the dock/app icon from
+// an .app bundle's .icns, not from winit's per-window icon (which it ignores), so
+// a binary launched straight from the terminal would otherwise show a generic
+// icon. Setting NSApplication's icon image fixes that — but it only sticks once
+// the app has finished launching, so it's invoked from a short delayed message
+// after startup (see Snack::new / Message::SetDockIcon), not before run().
+#[cfg(target_os = "macos")]
+pub(crate) fn set_macos_dock_icon()
+{
+    use objc2::ClassType;
+    use objc2_app_kit::{ NSApplication, NSApplicationActivationPolicy, NSImage };
+    use objc2_foundation::{ MainThreadMarker, NSData };
+
+    let Some(mtm) = MainThreadMarker::new() else { return; };
+    let app = NSApplication::sharedApplication(mtm);
+
+    // A binary launched straight from the terminal is not a bundled .app, so it
+    // can end up without regular-app status — which drops it out of the Cmd-Tab
+    // switcher (and a Dock restart can surface this). Pin it to Regular so it is
+    // always a focusable, switchable app.
+    app.setActivationPolicy(NSApplicationActivationPolicy::Regular);
+
+    let data = NSData::with_bytes(include_bytes!("../icon/snack-transparent-256.png"));
+    let Some(image) = NSImage::initWithData(NSImage::alloc(), &data) else { return; };
+    unsafe { app.setApplicationIconImage(Some(&image)); }
+}
+
 /// Default to `debug` for snack + libxmpp when built without
 /// optimisations (i.e. `cargo run`). `RUST_LOG`, when set, always wins.
 fn init_logging()

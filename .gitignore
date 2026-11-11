@@ -24,6 +24,9 @@ target
 # Added by cargo
 
 /target
+/snack.app
 # Local diagnostic logs can contain private chat details.
 *.log
+/icon/snack-1024.png
 .DS_Store
+/icon/snack-transparent-1024.png

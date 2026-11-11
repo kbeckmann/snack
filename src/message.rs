@@ -174,6 +174,9 @@ pub enum Message
     // to whole-message selection; otherwise it drives the body editor's own text
     // selection (edits are dropped to keep it read-only).
     BodyEditorAction { id: i64, action: text_editor::Action },
+    // Set the macOS dock icon (a no-op elsewhere). Fired shortly after launch,
+    // once the app has finished launching so the icon actually sticks.
+    SetDockIcon,
     ForgetAutoLogin,
     RetryCredentialRemoval,
     RetrySavedLogin,

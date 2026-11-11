@@ -532,6 +532,14 @@ impl Snack
         // Use the same guarded path at startup and after the keyring unlocks.
         let startup = snack.update(Message::RetrySavedLogin);
 
+        // On macOS, set the dock icon a moment after launch — setting it before
+        // the event loop is running doesn't stick (see main::set_macos_dock_icon).
+        #[cfg(target_os = "macos")]
+        let startup = Task::batch([
+            startup,
+            delay_then(std::time::Duration::from_millis(250), Message::SetDockIcon),
+        ]);
+
         return (snack, startup);
     }
 
