@@ -6383,7 +6383,7 @@ fn repaired_settings_can_be_reloaded_without_resetting_drafts_or_credentials() {
     repaired.jid = Some("repair@example".into());
     repaired.drafts.insert("room@example".into(), "recovered draft".into());
     storage::save_password("repair@example", "recovered secret").unwrap();
-    std::fs::write(&path, toml::to_string_pretty(&repaired).unwrap()).unwrap();
+    std::fs::write(&path, basic_toml::to_string(&repaired).unwrap()).unwrap();
     let _ = s.update(Message::RetryConfigLoad);
     assert!(s.saved_config.load_error.is_none());
     assert_eq!(s.saved_config.drafts["room@example"], "recovered draft");

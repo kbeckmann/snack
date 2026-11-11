@@ -33,13 +33,15 @@ pub struct SavedConfig
     #[serde(default)]
     pub room_account: Option<String>,
     #[serde(default)]
+    pub draft_account: Option<String>,
+    // Maps become TOML tables, which the serializer must write after all
+    // plain values: keep every map field below this point.
+    #[serde(default)]
     pub account_rooms: HashMap<String, Vec<String>>,
     // Unsent message text, keyed by room/contact JID, so each conversation
     // keeps its own in-progress draft across room switches and restarts.
     #[serde(default)]
     pub drafts: HashMap<String, String>,
-    #[serde(default)]
-    pub draft_account: Option<String>,
     #[serde(default)]
     pub account_drafts: HashMap<String, HashMap<String, String>>,
 }
@@ -270,8 +272,8 @@ pub fn load() -> SavedConfig
         }
         let contents = fs::read_to_string(&path).map_err(|error| format!("Could not read settings {}: {error}", path.display()))?;
         // Do not include draft contents from TOML source snippets in diagnostics.
-        let mut cfg = toml::from_str::<SavedConfig>(&contents)
-            .map_err(|error| format!("Could not parse settings {}: {}", path.display(), error.message()))?;
+        let mut cfg = basic_toml::from_str::<SavedConfig>(&contents)
+            .map_err(|error| format!("Could not parse settings {}: {}", path.display(), error))?;
         cfg.migrate_legacy_ownership();
         Ok(cfg)
     })();
@@ -333,7 +335,7 @@ pub fn save(cfg: &SavedConfig) -> Result<(), String>
     if cfg.load_error.is_some() { return Err("Settings were not loaded; recover them before saving. Original settings were kept.".into()); }
     let path = config_path().ok_or_else(|| "no config directory".to_string())?;
 
-    let serialized = toml::to_string_pretty(cfg).map_err(|e| e.to_string())?;
+    let serialized = basic_toml::to_string(cfg).map_err(|e| e.to_string())?;
     save_config_file(&path, serialized.as_bytes()).map_err(|e| e.to_string())
 }
 
@@ -929,7 +931,7 @@ mod tests
     #[test]
     fn old_configurations_default_the_new_persistence_fields()
     {
-        let config: SavedConfig = toml::from_str("jid = 'test@example.invalid'\nrooms = ['room@example.invalid']\n").unwrap();
+        let config: SavedConfig = basic_toml::from_str("jid = 'test@example.invalid'\nrooms = ['room@example.invalid']\n").unwrap();
         assert!(config.drafts.is_empty());
         assert!(config.account_drafts.is_empty());
         assert!(config.draft_account.is_none());
@@ -951,7 +953,7 @@ mod tests
             reader_ready.wait();
             loop {
                 let contents = fs::read_to_string(&path).unwrap();
-                let parsed: SavedConfig = toml::from_str(&contents).unwrap();
+                let parsed: SavedConfig = basic_toml::from_str(&contents).unwrap();
                 let draft = &parsed.drafts["room@example.invalid"];
                 assert_eq!(draft.len(), 32_000);
                 assert!(draft.chars().all(|ch| ch == 'a') || draft.chars().all(|ch| ch == 'b'));
