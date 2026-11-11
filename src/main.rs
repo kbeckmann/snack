@@ -25,6 +25,8 @@ pub use message::Message;
 fn main() -> Result<(), Box<dyn std::error::Error>>
 {
     init_logging();
+    log::info!("Snack {} starting ({} build)", env!("CARGO_PKG_VERSION"),
+        if cfg!(debug_assertions) { "debug" } else { "release" });
     // Keep the OS lock until the UI and its worker subscriptions have stopped.
     // A secondary launch only requests activation; it never loads user state.
     let Some(_instance) = instance::acquire()? else { return Ok(()); };
