@@ -6,7 +6,11 @@ rust-version = "1.89"
 
 [dependencies]
 libxmpp = { version = "0.3.1", path = "vendor/libxmpp" }
-iced = { version = "0.14.0", features = ["tokio", "advanced"] }
+# Defaults minus the thread-pool executor (Snack runs on tokio) and Linux
+# theme detection (Snack uses a fixed theme).
+iced = { version = "0.14.0", default-features = false, features = [
+    "tokio", "advanced", "wgpu", "tiny-skia", "crisp", "web-colors", "x11", "wayland",
+] }
 tokio = { version = "1.53.1", features = ["full"] }
 chrono = "0.4.45"
 log = "0.4.33"
